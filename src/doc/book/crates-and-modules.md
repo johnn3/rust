@@ -26,8 +26,7 @@ two languages for those phrases to be in. We’ll use this module layout:
 ```text
                                     +-----------+
                                 +---| greetings |
-                                |   +-----------+
-                  +---------+   |
+                  +---------+   |   +-----------+
               +---| english |---+
               |   +---------+   |   +-----------+
               |                 +---| farewells |
@@ -37,8 +36,7 @@ two languages for those phrases to be in. We’ll use this module layout:
               |                 +---| greetings |
               |   +----------+  |   +-----------+
               +---| japanese |--+
-                  +----------+  |
-                                |   +-----------+
+                  +----------+  |   +-----------+
                                 +---| farewells |
                                     +-----------+
 ```

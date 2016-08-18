@@ -390,7 +390,7 @@ impl fmt::Debug for Wtf8 {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         fn write_str_escaped(f: &mut fmt::Formatter, s: &str) -> fmt::Result {
             use fmt::Write;
-            for c in s.chars().flat_map(|c| c.escape_default()) {
+            for c in s.chars().flat_map(|c| c.escape_debug()) {
                 f.write_char(c)?
             }
             Ok(())
@@ -408,7 +408,7 @@ impl fmt::Debug for Wtf8 {
                             &self.bytes[pos .. surrogate_pos]
                         )},
                     )?;
-                    write!(formatter, "\\u{{{:X}}}", surrogate)?;
+                    write!(formatter, "\\u{{{:x}}}", surrogate)?;
                     pos = surrogate_pos + 3;
                 }
             }
@@ -567,7 +567,7 @@ impl Wtf8 {
             return None
         }
         match &self.bytes[(len - 3)..] {
-            [0xED, b2 @ 0xA0...0xAF, b3] => Some(decode_surrogate(b2, b3)),
+            &[0xED, b2 @ 0xA0...0xAF, b3] => Some(decode_surrogate(b2, b3)),
             _ => None
         }
     }
@@ -579,7 +579,7 @@ impl Wtf8 {
             return None
         }
         match &self.bytes[..3] {
-            [0xED, b2 @ 0xB0...0xBF, b3] => Some(decode_surrogate(b2, b3)),
+            &[0xED, b2 @ 0xB0...0xBF, b3] => Some(decode_surrogate(b2, b3)),
             _ => None
         }
     }
@@ -715,7 +715,7 @@ impl<'a> Iterator for Wtf8CodePoints<'a> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (len, _) = self.bytes.size_hint();
+        let len = self.bytes.len();
         (len.saturating_add(3) / 4, Some(len))
     }
 }
@@ -1064,9 +1064,9 @@ mod tests {
 
     #[test]
     fn wtf8buf_show() {
-        let mut string = Wtf8Buf::from_str("a\té 💩\r");
+        let mut string = Wtf8Buf::from_str("a\té \u{7f}💩\r");
         string.push(CodePoint::from_u32(0xD800).unwrap());
-        assert_eq!(format!("{:?}", string), r#""a\t\u{e9} \u{1f4a9}\r\u{D800}""#);
+        assert_eq!(format!("{:?}", string), "\"a\\té \\u{7f}\u{1f4a9}\\r\\u{d800}\"");
     }
 
     #[test]

@@ -26,7 +26,6 @@ use rustc::hir::def;
 use rustc::hir::def_id::{CRATE_DEF_INDEX, DefId};
 use middle::dependency_format::Linkage;
 use rustc::dep_graph::{DepGraph, DepNode, DepTask};
-use rustc::ty::subst;
 use rustc::traits::specialization_graph;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::util::IntTypeExt;
@@ -44,10 +43,10 @@ use std::rc::Rc;
 use std::u32;
 use syntax::abi::Abi;
 use syntax::ast::{self, NodeId, Name, CRATE_NODE_ID, CrateNum};
-use syntax::codemap::BytePos;
-use syntax::attr;
-use syntax::errors::Handler;
+use syntax::attr::{self,AttrMetaMethods,AttributeMethods};
+use errors::Handler;
 use syntax;
+use syntax_pos::BytePos;
 use rbml::writer::Encoder;
 
 use rustc::hir::{self, PatKind};
@@ -176,8 +175,7 @@ fn encode_bounds_and_type<'a, 'tcx>(rbml_w: &mut Encoder,
                                     index: &mut CrateIndex<'a, 'tcx>,
                                     scheme: &ty::TypeScheme<'tcx>,
                                     predicates: &ty::GenericPredicates<'tcx>) {
-    encode_generics(rbml_w, ecx, index,
-                    &scheme.generics, &predicates, tag_item_generics);
+    encode_generics(rbml_w, ecx, index, &scheme.generics, &predicates);
     encode_type(ecx, rbml_w, scheme.ty);
 }
 
@@ -217,7 +215,7 @@ fn encode_parent_item(rbml_w: &mut Encoder, id: DefId) {
 fn encode_struct_fields(rbml_w: &mut Encoder,
                         variant: ty::VariantDef) {
     for f in &variant.fields {
-        if variant.is_tuple_struct() {
+        if variant.kind == ty::VariantKind::Tuple {
             rbml_w.start_tag(tag_item_unnamed_field);
         } else {
             rbml_w.start_tag(tag_item_field);
@@ -250,7 +248,7 @@ fn encode_enum_variant_info<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         let _task = index.record(vid, rbml_w);
         rbml_w.start_tag(tag_items_data_item);
         encode_def_id_and_key(ecx, rbml_w, vid);
-        encode_family(rbml_w, match variant.kind() {
+        encode_family(rbml_w, match variant.kind {
             ty::VariantKind::Struct => 'V',
             ty::VariantKind::Tuple => 'v',
             ty::VariantKind::Unit => 'w',
@@ -511,56 +509,29 @@ fn encode_generics<'a, 'tcx>(rbml_w: &mut Encoder,
                              ecx: &EncodeContext<'a, 'tcx>,
                              index: &mut CrateIndex<'a, 'tcx>,
                              generics: &ty::Generics<'tcx>,
-                             predicates: &ty::GenericPredicates<'tcx>,
-                             tag: usize)
+                             predicates: &ty::GenericPredicates<'tcx>)
 {
-    rbml_w.start_tag(tag);
-
-    for param in &generics.types {
-        rbml_w.start_tag(tag_type_param_def);
-        tyencode::enc_type_param_def(rbml_w.writer, &ecx.ty_str_ctxt(), param);
-        rbml_w.mark_stable_position();
-        rbml_w.end_tag();
-    }
-
-    // Region parameters
-    for param in &generics.regions {
-        rbml_w.start_tag(tag_region_param_def);
-        tyencode::enc_region_param_def(rbml_w.writer, &ecx.ty_str_ctxt(), param);
-        rbml_w.mark_stable_position();
-        rbml_w.end_tag();
-    }
-
-    encode_predicates_in_current_doc(rbml_w, ecx, index, predicates);
-
+    rbml_w.start_tag(tag_item_generics);
+    tyencode::enc_generics(rbml_w.writer, &ecx.ty_str_ctxt(), generics);
+    rbml_w.mark_stable_position();
     rbml_w.end_tag();
-}
 
-fn encode_predicates_in_current_doc<'a,'tcx>(rbml_w: &mut Encoder,
-                                             _ecx: &EncodeContext<'a,'tcx>,
-                                             index: &mut CrateIndex<'a, 'tcx>,
-                                             predicates: &ty::GenericPredicates<'tcx>)
-{
-    for (space, _, predicate) in predicates.predicates.iter_enumerated() {
-        let tag = match space {
-            subst::TypeSpace => tag_type_predicate,
-            subst::SelfSpace => tag_self_predicate,
-            subst::FnSpace => tag_fn_predicate
-        };
-
-        rbml_w.wr_tagged_u32(tag,
-            index.add_xref(XRef::Predicate(predicate.clone())));
-    }
+    encode_predicates(rbml_w, index, predicates, tag_item_predicates);
 }
 
 fn encode_predicates<'a,'tcx>(rbml_w: &mut Encoder,
-                              ecx: &EncodeContext<'a,'tcx>,
                               index: &mut CrateIndex<'a, 'tcx>,
                               predicates: &ty::GenericPredicates<'tcx>,
                               tag: usize)
 {
     rbml_w.start_tag(tag);
-    encode_predicates_in_current_doc(rbml_w, ecx, index, predicates);
+    if let Some(def_id) = predicates.parent {
+        rbml_w.wr_tagged_u64(tag_items_data_parent_item, def_to_u64(def_id));
+    }
+    for predicate in &predicates.predicates {
+        rbml_w.wr_tagged_u32(tag_predicate,
+            index.add_xref(XRef::Predicate(predicate.clone())));
+    }
     rbml_w.end_tag();
 }
 
@@ -571,8 +542,7 @@ fn encode_method_ty_fields<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
     encode_def_id_and_key(ecx, rbml_w, method_ty.def_id);
     encode_name(rbml_w, method_ty.name);
     encode_generics(rbml_w, ecx, index,
-                    &method_ty.generics, &method_ty.predicates,
-                    tag_method_ty_generics);
+                    &method_ty.generics, &method_ty.predicates);
     encode_visibility(rbml_w, method_ty.vis);
     encode_explicit_self(rbml_w, &method_ty.explicit_self);
     match method_ty.explicit_self {
@@ -653,9 +623,9 @@ fn encode_info_for_method<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
     if let Some(impl_item) = impl_item_opt {
         if let hir::ImplItemKind::Method(ref sig, _) = impl_item.node {
             encode_attributes(rbml_w, &impl_item.attrs);
-            let scheme = ecx.tcx.lookup_item_type(m.def_id);
-            let any_types = !scheme.generics.types.is_empty();
-            let needs_inline = any_types || is_default_impl ||
+            let generics = ecx.tcx.lookup_generics(m.def_id);
+            let types = generics.parent_types as usize + generics.types.len();
+            let needs_inline = types > 0 || is_default_impl ||
                                attr::requests_inline(&impl_item.attrs);
             if needs_inline || sig.constness == hir::Constness::Const {
                 encode_inlined_item(ecx,
@@ -702,7 +672,7 @@ fn encode_info_for_associated_type<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         encode_attributes(rbml_w, &ii.attrs);
         encode_defaultness(rbml_w, ii.defaultness);
     } else {
-        encode_predicates(rbml_w, ecx, index,
+        encode_predicates(rbml_w, index,
                           &ecx.tcx.lookup_predicates(associated_type.def_id),
                           tag_item_generics);
     }
@@ -743,7 +713,8 @@ fn encode_repr_attrs(rbml_w: &mut Encoder,
 }
 
 fn encode_mir(ecx: &EncodeContext, rbml_w: &mut Encoder, node_id: NodeId) {
-    if let Some(mir) = ecx.mir_map.map.get(&node_id) {
+    let def_id = ecx.tcx.map.local_def_id(node_id);
+    if let Some(mir) = ecx.mir_map.map.get(&def_id) {
         rbml_w.start_tag(tag_mir as usize);
         rbml_w.emit_opaque(|opaque_encoder| {
             tls::enter_encoding_context(ecx, opaque_encoder, |_, opaque_encoder| {
@@ -861,7 +832,7 @@ fn encode_info_for_item<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         encode_bounds_and_type_for_item(rbml_w, ecx, index, item.id);
         encode_name(rbml_w, item.name);
         encode_attributes(rbml_w, &item.attrs);
-        encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(item));
+        encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(def_id, item));
         encode_mir(ecx, rbml_w, item.id);
         encode_visibility(rbml_w, vis);
         encode_stability(rbml_w, stab);
@@ -879,7 +850,7 @@ fn encode_info_for_item<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         encode_attributes(rbml_w, &item.attrs);
         let needs_inline = tps_len > 0 || attr::requests_inline(&item.attrs);
         if needs_inline || constness == hir::Constness::Const {
-            encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(item));
+            encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(def_id, item));
             encode_mir(ecx, rbml_w, item.id);
         }
         encode_constness(rbml_w, constness);
@@ -942,7 +913,7 @@ fn encode_info_for_item<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         for v in &enum_definition.variants {
             encode_variant_id(rbml_w, ecx.tcx.map.local_def_id(v.node.data.id()));
         }
-        encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(item));
+        encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(def_id, item));
         encode_mir(ecx, rbml_w, item.id);
 
         // Encode inherent implementations for this enumeration.
@@ -989,7 +960,7 @@ fn encode_info_for_item<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         needs to know*/
         encode_struct_fields(rbml_w, variant);
 
-        encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(item));
+        encode_inlined_item(ecx, rbml_w, InlinedItemRef::Item(def_id, item));
         encode_mir(ecx, rbml_w, item.id);
 
         // Encode inherent implementations for this structure.
@@ -1140,9 +1111,8 @@ fn encode_info_for_item<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         encode_defaulted(rbml_w, tcx.trait_has_default_impl(def_id));
         encode_associated_type_names(rbml_w, &trait_def.associated_type_names);
         encode_generics(rbml_w, ecx, index,
-                        &trait_def.generics, &trait_predicates,
-                        tag_item_generics);
-        encode_predicates(rbml_w, ecx, index,
+                        &trait_def.generics, &trait_predicates);
+        encode_predicates(rbml_w, index,
                           &tcx.lookup_super_predicates(def_id),
                           tag_item_super_predicates);
         encode_trait_ref(rbml_w, ecx, trait_def.trait_ref, tag_item_trait_ref);
@@ -1311,7 +1281,7 @@ fn encode_info_for_foreign_item<'a, 'tcx>(ecx: &EncodeContext<'a, 'tcx>,
         encode_bounds_and_type_for_item(rbml_w, ecx, index, nitem.id);
         encode_name(rbml_w, nitem.name);
         if abi == Abi::RustIntrinsic || abi == Abi::PlatformIntrinsic {
-            encode_inlined_item(ecx, rbml_w, InlinedItemRef::Foreign(nitem));
+            encode_inlined_item(ecx, rbml_w, InlinedItemRef::Foreign(def_id, nitem));
             encode_mir(ecx, rbml_w, nitem.id);
         }
         encode_attributes(rbml_w, &nitem.attrs);
@@ -1351,6 +1321,7 @@ fn my_visit_expr(expr: &hir::Expr,
 
             rbml_w.start_tag(tag_items_data_item);
             encode_def_id_and_key(ecx, rbml_w, def_id);
+            encode_name(rbml_w, syntax::parse::token::intern("<closure>"));
 
             rbml_w.start_tag(tag_items_closure_ty);
             write_closure_type(ecx, rbml_w, &ecx.tcx.tables.borrow().closure_tys[&def_id]);
@@ -1360,7 +1331,7 @@ fn my_visit_expr(expr: &hir::Expr,
             ecx.tcx.closure_kind(def_id).encode(rbml_w).unwrap();
             rbml_w.end_tag();
 
-            assert!(ecx.mir_map.map.contains_key(&expr.id));
+            assert!(ecx.mir_map.map.contains_key(&def_id));
             encode_mir(ecx, rbml_w, expr.id);
 
             rbml_w.end_tag();
@@ -1387,6 +1358,20 @@ impl<'a, 'b, 'c, 'tcx> Visitor<'tcx> for EncodeVisitor<'a, 'b, 'c, 'tcx> {
     fn visit_foreign_item(&mut self, ni: &'tcx hir::ForeignItem) {
         intravisit::walk_foreign_item(self, ni);
         encode_info_for_foreign_item(self.ecx, self.rbml_w_for_visit_item, ni, self.index);
+    }
+    fn visit_ty(&mut self, ty: &'tcx hir::Ty) {
+        intravisit::walk_ty(self, ty);
+
+        if let hir::TyImplTrait(_) = ty.node {
+            let rbml_w = &mut *self.rbml_w_for_visit_item;
+            let def_id = self.ecx.tcx.map.local_def_id(ty.id);
+            let _task = self.index.record(def_id, rbml_w);
+            rbml_w.start_tag(tag_items_data_item);
+            encode_def_id_and_key(self.ecx, rbml_w, def_id);
+            encode_family(rbml_w, 'y');
+            encode_bounds_and_type_for_item(rbml_w, self.ecx, self.index, ty.id);
+            rbml_w.end_tag();
+        }
     }
 }
 
@@ -1430,31 +1415,28 @@ fn encode_item_index(rbml_w: &mut Encoder, index: IndexData) {
 }
 
 fn encode_meta_item(rbml_w: &mut Encoder, mi: &ast::MetaItem) {
-    match mi.node {
-      ast::MetaItemKind::Word(ref name) => {
+    if mi.is_word() {
+        let name = mi.name();
         rbml_w.start_tag(tag_meta_item_word);
-        rbml_w.wr_tagged_str(tag_meta_item_name, name);
+        rbml_w.wr_tagged_str(tag_meta_item_name, &name);
         rbml_w.end_tag();
-      }
-      ast::MetaItemKind::NameValue(ref name, ref value) => {
-        match value.node {
-          ast::LitKind::Str(ref value, _) => {
-            rbml_w.start_tag(tag_meta_item_name_value);
-            rbml_w.wr_tagged_str(tag_meta_item_name, name);
-            rbml_w.wr_tagged_str(tag_meta_item_value, value);
-            rbml_w.end_tag();
-          }
-          _ => {/* FIXME (#623): encode other variants */ }
-        }
-      }
-      ast::MetaItemKind::List(ref name, ref items) => {
+    } else if mi.is_value_str() {
+        let name = mi.name();
+        /* FIXME (#623): support other literal kinds */
+        let value = mi.value_str().unwrap();
+        rbml_w.start_tag(tag_meta_item_name_value);
+        rbml_w.wr_tagged_str(tag_meta_item_name, &name);
+        rbml_w.wr_tagged_str(tag_meta_item_value, &value);
+        rbml_w.end_tag();
+    } else { // it must be a list
+        let name = mi.name();
+        let items = mi.meta_item_list().unwrap();
         rbml_w.start_tag(tag_meta_item_list);
-        rbml_w.wr_tagged_str(tag_meta_item_name, name);
+        rbml_w.wr_tagged_str(tag_meta_item_name, &name);
         for inner_item in items {
             encode_meta_item(rbml_w, &inner_item);
         }
         rbml_w.end_tag();
-      }
     }
 }
 
@@ -1463,7 +1445,7 @@ fn encode_attributes(rbml_w: &mut Encoder, attrs: &[ast::Attribute]) {
     for attr in attrs {
         rbml_w.start_tag(tag_attribute);
         rbml_w.wr_tagged_u8(tag_attribute_is_sugared_doc, attr.node.is_sugared_doc as u8);
-        encode_meta_item(rbml_w, &attr.node.value);
+        encode_meta_item(rbml_w, attr.meta());
         rbml_w.end_tag();
     }
     rbml_w.end_tag();
@@ -1505,7 +1487,7 @@ fn encode_polarity(rbml_w: &mut Encoder, polarity: hir::ImplPolarity) {
 
 fn encode_crate_deps(rbml_w: &mut Encoder, cstore: &cstore::CStore) {
     fn get_ordered_deps(cstore: &cstore::CStore)
-                        -> Vec<(CrateNum, Rc<cstore::crate_metadata>)> {
+                        -> Vec<(CrateNum, Rc<cstore::CrateMetadata>)> {
         // Pull the cnums and name,vers,hash out of cstore
         let mut deps = Vec::new();
         cstore.iter_crate_data(|cnum, val| {
@@ -1736,7 +1718,7 @@ fn encode_reachable(ecx: &EncodeContext, rbml_w: &mut Encoder) {
 }
 
 fn encode_crate_dep(rbml_w: &mut Encoder,
-                    dep: &cstore::crate_metadata) {
+                    dep: &cstore::CrateMetadata) {
     rbml_w.start_tag(tag_crate_dep);
     rbml_w.wr_tagged_str(tag_crate_dep_crate_name, &dep.name());
     let hash = decoder::get_crate_hash(dep.data());
@@ -1798,10 +1780,6 @@ fn encode_panic_strategy(rbml_w: &mut Encoder, ecx: &EncodeContext) {
     }
 }
 
-// NB: Increment this as you change the metadata encoding version.
-#[allow(non_upper_case_globals)]
-pub const metadata_encoding_version : &'static [u8] = &[b'r', b'u', b's', b't', 0, 0, 0, 2 ];
-
 pub fn encode_metadata(ecx: EncodeContext, krate: &hir::Crate) -> Vec<u8> {
     let mut wr = Cursor::new(Vec::new());
 
@@ -1835,12 +1813,25 @@ pub fn encode_metadata(ecx: EncodeContext, krate: &hir::Crate) -> Vec<u8> {
     // the length of the metadata to the start of the metadata. Later on this
     // will allow us to slice the metadata to the precise length that we just
     // generated regardless of trailing bytes that end up in it.
-    let len = v.len() as u32;
-    v.insert(0, (len >>  0) as u8);
-    v.insert(0, (len >>  8) as u8);
-    v.insert(0, (len >> 16) as u8);
-    v.insert(0, (len >> 24) as u8);
-    return v;
+    //
+    // We also need to store the metadata encoding version here, because
+    // rlibs don't have it. To get older versions of rustc to ignore
+    // this metadata, there are 4 zero bytes at the start, which are
+    // treated as a length of 0 by old compilers.
+
+    let len = v.len();
+    let mut result = vec![];
+    result.push(0);
+    result.push(0);
+    result.push(0);
+    result.push(0);
+    result.extend(metadata_encoding_version.iter().cloned());
+    result.push((len >> 24) as u8);
+    result.push((len >> 16) as u8);
+    result.push((len >>  8) as u8);
+    result.push((len >>  0) as u8);
+    result.extend(v);
+    result
 }
 
 fn encode_metadata_inner(rbml_w: &mut Encoder,
@@ -1883,7 +1874,7 @@ fn encode_metadata_inner(rbml_w: &mut Encoder,
     encode_crate_name(rbml_w, &ecx.link_meta.crate_name);
     encode_crate_triple(rbml_w, &ecx.tcx.sess.opts.target_triple);
     encode_hash(rbml_w, &ecx.link_meta.crate_hash);
-    encode_crate_disambiguator(rbml_w, &ecx.tcx.sess.crate_disambiguator.get().as_str());
+    encode_crate_disambiguator(rbml_w, &ecx.tcx.sess.local_crate_disambiguator());
     encode_dylib_dependency_formats(rbml_w, &ecx);
     encode_panic_strategy(rbml_w, &ecx);
 

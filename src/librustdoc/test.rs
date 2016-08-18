@@ -26,7 +26,8 @@ use rustc_lint;
 use rustc::dep_graph::DepGraph;
 use rustc::hir::map as hir_map;
 use rustc::session::{self, config};
-use rustc::session::config::{get_unstable_features_setting, OutputType};
+use rustc::session::config::{get_unstable_features_setting, OutputType,
+                             OutputTypes, Externs};
 use rustc::session::search_paths::{SearchPaths, PathKind};
 use rustc_back::dynamic_lib::DynamicLibrary;
 use rustc_back::tempdir::TempDir;
@@ -35,9 +36,8 @@ use rustc_driver::driver::phase_2_configure_and_expand;
 use rustc_metadata::cstore::CStore;
 use rustc_resolve::MakeGlobMap;
 use syntax::codemap::CodeMap;
-use syntax::errors;
-use syntax::errors::emitter::ColorConfig;
-use syntax::parse::token;
+use errors;
+use errors::emitter::ColorConfig;
 
 use core;
 use clean;
@@ -56,7 +56,7 @@ pub struct TestOptions {
 pub fn run(input: &str,
            cfgs: Vec<String>,
            libs: SearchPaths,
-           externs: core::Externs,
+           externs: Externs,
            mut test_args: Vec<String>,
            crate_name: Option<String>)
            -> isize {
@@ -75,14 +75,13 @@ pub fn run(input: &str,
 
     let codemap = Rc::new(CodeMap::new());
     let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
-                                                               None,
                                                                true,
                                                                false,
-                                                               codemap.clone());
+                                                               Some(codemap.clone()));
 
     let dep_graph = DepGraph::new(false);
     let _ignore = dep_graph.in_ignore();
-    let cstore = Rc::new(CStore::new(&dep_graph, token::get_ident_interner()));
+    let cstore = Rc::new(CStore::new(&dep_graph));
     let sess = session::build_session_(sessopts,
                                        &dep_graph,
                                        Some(input_path.clone()),
@@ -91,13 +90,12 @@ pub fn run(input: &str,
                                        cstore.clone());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
-    let mut cfg = config::build_configuration(&sess);
-    cfg.extend(config::parse_cfgspecs(cfgs.clone()));
+    let cfg = config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
     let krate = panictry!(driver::phase_1_parse_input(&sess, cfg, &input));
     let driver::ExpansionResult { defs, mut hir_forest, .. } = {
-        let make_glob_map = MakeGlobMap::No;
-        phase_2_configure_and_expand(&sess, &cstore, krate, "rustdoc-test", None, make_glob_map)
-            .expect("phase_2_configure_and_expand aborted in rustdoc!")
+        phase_2_configure_and_expand(
+            &sess, &cstore, krate, "rustdoc-test", None, MakeGlobMap::No, |_| Ok(())
+        ).expect("phase_2_configure_and_expand aborted in rustdoc!")
     };
 
     let dep_graph = DepGraph::new(false);
@@ -174,9 +172,9 @@ fn scrape_test_config(krate: &::rustc::hir::Crate) -> TestOptions {
 }
 
 fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
-           externs: core::Externs,
+           externs: Externs,
            should_panic: bool, no_run: bool, as_test_harness: bool,
-           compile_fail: bool, opts: &TestOptions) {
+           compile_fail: bool, mut error_codes: Vec<String>, opts: &TestOptions) {
     // the test harness wants its own `main` & top level functions, so
     // never wrap the test in `fn main() { ... }`
     let test = maketest(test, Some(cratename), as_test_harness, opts);
@@ -184,8 +182,7 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
         name: driver::anon_src(),
         input: test.to_owned(),
     };
-    let mut outputs = HashMap::new();
-    outputs.insert(OutputType::Exe, None);
+    let outputs = OutputTypes::new(&[(OutputType::Exe, None)]);
 
     let sessopts = config::Options {
         maybe_sysroot: Some(env::current_exe().unwrap().parent().unwrap()
@@ -229,16 +226,15 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
     let data = Arc::new(Mutex::new(Vec::new()));
     let codemap = Rc::new(CodeMap::new());
     let emitter = errors::emitter::EmitterWriter::new(box Sink(data.clone()),
-                                                      None,
-                                                      codemap.clone());
+                                                      Some(codemap.clone()));
     let old = io::set_panic(box Sink(data.clone()));
-    let _bomb = Bomb(data, old.unwrap_or(box io::stdout()));
+    let _bomb = Bomb(data.clone(), old.unwrap_or(box io::stdout()));
 
     // Compile the code
     let diagnostic_handler = errors::Handler::with_emitter(true, false, box emitter);
 
     let dep_graph = DepGraph::new(false);
-    let cstore = Rc::new(CStore::new(&dep_graph, token::get_ident_interner()));
+    let cstore = Rc::new(CStore::new(&dep_graph));
     let sess = session::build_session_(sessopts,
                                        &dep_graph,
                                        None,
@@ -250,8 +246,7 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
     let outdir = Mutex::new(TempDir::new("rustdoctest").ok().expect("rustdoc needs a tempdir"));
     let libdir = sess.target_filesearch(PathKind::All).get_lib_path();
     let mut control = driver::CompileController::basic();
-    let mut cfg = config::build_configuration(&sess);
-    cfg.extend(config::parse_cfgspecs(cfgs.clone()));
+    let cfg = config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
     let out = Some(outdir.lock().unwrap().path().to_path_buf());
 
     if no_run {
@@ -273,13 +268,28 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
                     } else if count == 0 && compile_fail == true {
                         panic!("test compiled while it wasn't supposed to")
                     }
+                    if count > 0 && error_codes.len() > 0 {
+                        let out = String::from_utf8(data.lock().unwrap().to_vec()).unwrap();
+                        error_codes.retain(|err| !out.contains(err));
+                    }
                 }
                 Ok(()) if compile_fail => panic!("test compiled while it wasn't supposed to"),
                 _ => {}
             }
         }
-        Err(_) if compile_fail == false => panic!("couldn't compile the test"),
-        _ => {}
+        Err(_) => {
+            if compile_fail == false {
+                panic!("couldn't compile the test");
+            }
+            if error_codes.len() > 0 {
+                let out = String::from_utf8(data.lock().unwrap().to_vec()).unwrap();
+                error_codes.retain(|err| !out.contains(err));
+            }
+        }
+    }
+
+    if error_codes.len() > 0 {
+        panic!("Some expected error codes were not found: {:?}", error_codes);
     }
 
     if no_run { return }
@@ -384,7 +394,7 @@ pub struct Collector {
     names: Vec<String>,
     cfgs: Vec<String>,
     libs: SearchPaths,
-    externs: core::Externs,
+    externs: Externs,
     cnt: usize,
     use_headers: bool,
     current_header: Option<String>,
@@ -393,7 +403,7 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new(cratename: String, cfgs: Vec<String>, libs: SearchPaths, externs: core::Externs,
+    pub fn new(cratename: String, cfgs: Vec<String>, libs: SearchPaths, externs: Externs,
                use_headers: bool, opts: TestOptions) -> Collector {
         Collector {
             tests: Vec::new(),
@@ -411,7 +421,7 @@ impl Collector {
 
     pub fn add_test(&mut self, test: String,
                     should_panic: bool, no_run: bool, should_ignore: bool,
-                    as_test_harness: bool, compile_fail: bool) {
+                    as_test_harness: bool, compile_fail: bool, error_codes: Vec<String>) {
         let name = if self.use_headers {
             let s = self.current_header.as_ref().map(|s| &**s).unwrap_or("");
             format!("{}_{}", s, self.cnt)
@@ -442,6 +452,7 @@ impl Collector {
                         no_run,
                         as_test_harness,
                         compile_fail,
+                        error_codes,
                         &opts);
             })
         });

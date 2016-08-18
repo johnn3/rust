@@ -37,6 +37,7 @@ use clone::Clone;
 use cmp::{Ordering, PartialEq, PartialOrd, Eq, Ord};
 use cmp::Ordering::{Less, Equal, Greater};
 use cmp;
+use convert::AsRef;
 use default::Default;
 use fmt;
 use intrinsics::assume;
@@ -50,6 +51,7 @@ use result::Result::{Ok, Err};
 use ptr;
 use mem;
 use marker::{Copy, Send, Sync, self};
+use iter_private::TrustedRandomAccess;
 
 #[repr(C)]
 struct Repr<T> {
@@ -104,11 +106,11 @@ pub trait SliceExt {
     fn binary_search(&self, x: &Self::Item) -> Result<usize, usize>
         where Self::Item: Ord;
     #[stable(feature = "core", since = "1.6.0")]
-    fn binary_search_by<F>(&self, f: F) -> Result<usize, usize>
-        where F: FnMut(&Self::Item) -> Ordering;
+    fn binary_search_by<'a, F>(&'a self, f: F) -> Result<usize, usize>
+        where F: FnMut(&'a Self::Item) -> Ordering;
     #[stable(feature = "slice_binary_search_by_key", since = "1.10.0")]
-    fn binary_search_by_key<B, F>(&self, b: &B, f: F) -> Result<usize, usize>
-        where F: FnMut(&Self::Item) -> B,
+    fn binary_search_by_key<'a, B, F>(&'a self, b: &B, f: F) -> Result<usize, usize>
+        where F: FnMut(&'a Self::Item) -> B,
               B: Ord;
     #[stable(feature = "core", since = "1.6.0")]
     fn len(&self) -> usize;
@@ -300,8 +302,8 @@ impl<T> SliceExt for [T] {
         self as *const [T] as *const T
     }
 
-    fn binary_search_by<F>(&self, mut f: F) -> Result<usize, usize> where
-        F: FnMut(&T) -> Ordering
+    fn binary_search_by<'a, F>(&'a self, mut f: F) -> Result<usize, usize>
+        where F: FnMut(&'a T) -> Ordering
     {
         let mut base = 0usize;
         let mut s = self;
@@ -513,8 +515,8 @@ impl<T> SliceExt for [T] {
     }
 
     #[inline]
-    fn binary_search_by_key<B, F>(&self, b: &B, mut f: F) -> Result<usize, usize>
-        where F: FnMut(&Self::Item) -> B,
+    fn binary_search_by_key<'a, B, F>(&'a self, b: &B, mut f: F) -> Result<usize, usize>
+        where F: FnMut(&'a Self::Item) -> B,
               B: Ord
     {
         self.binary_search_by(|k| f(k).cmp(b))
@@ -834,7 +836,7 @@ macro_rules! iterator {
 
             #[inline]
             fn count(self) -> usize {
-                self.size_hint().0
+                self.len()
             }
 
             #[inline]
@@ -901,6 +903,8 @@ macro_rules! make_mut_slice {
 
 /// Immutable slice iterator
 ///
+/// This struct is created by the [`iter`] method on [slices].
+///
 /// # Examples
 ///
 /// Basic usage:
@@ -914,6 +918,9 @@ macro_rules! make_mut_slice {
 ///     println!("{}", element);
 /// }
 /// ```
+///
+/// [`iter`]: ../../std/primitive.slice.html#method.iter
+/// [slices]: ../../std/primitive.slice.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Iter<'a, T: 'a> {
     ptr: *const T,
@@ -990,7 +997,16 @@ impl<'a, T> Clone for Iter<'a, T> {
     fn clone(&self) -> Iter<'a, T> { Iter { ptr: self.ptr, end: self.end, _marker: self._marker } }
 }
 
+#[stable(feature = "slice_iter_as_ref", since = "1.12.0")]
+impl<'a, T> AsRef<[T]> for Iter<'a, T> {
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
 /// Mutable slice iterator.
+///
+/// This struct is created by the [`iter_mut`] method on [slices].
 ///
 /// # Examples
 ///
@@ -1009,6 +1025,9 @@ impl<'a, T> Clone for Iter<'a, T> {
 /// // We now have "[2, 3, 4]":
 /// println!("{:?}", slice);
 /// ```
+///
+/// [`iter_mut`]: ../../std/primitive.slice.html#method.iter_mut
+/// [slices]: ../../std/primitive.slice.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct IterMut<'a, T: 'a> {
     ptr: *mut T,
@@ -1443,7 +1462,7 @@ impl<'a, T> Iterator for Windows<'a, T> {
 
     #[inline]
     fn count(self) -> usize {
-        self.size_hint().0
+        self.len()
     }
 
     #[inline]
@@ -1540,7 +1559,7 @@ impl<'a, T> Iterator for Chunks<'a, T> {
 
     #[inline]
     fn count(self) -> usize {
-        self.size_hint().0
+        self.len()
     }
 
     #[inline]
@@ -1631,7 +1650,7 @@ impl<'a, T> Iterator for ChunksMut<'a, T> {
 
     #[inline]
     fn count(self) -> usize {
-        self.size_hint().0
+        self.len()
     }
 
     #[inline]
@@ -1942,3 +1961,17 @@ macro_rules! impl_marker_for {
 
 impl_marker_for!(BytewiseEquality,
                  u8 i8 u16 i16 u32 i32 u64 i64 usize isize char bool);
+
+#[doc(hidden)]
+unsafe impl<'a, T> TrustedRandomAccess for Iter<'a, T> {
+    unsafe fn get_unchecked(&mut self, i: usize) -> &'a T {
+        &*self.ptr.offset(i as isize)
+    }
+}
+
+#[doc(hidden)]
+unsafe impl<'a, T> TrustedRandomAccess for IterMut<'a, T> {
+    unsafe fn get_unchecked(&mut self, i: usize) -> &'a mut T {
+        &mut *self.ptr.offset(i as isize)
+    }
+}

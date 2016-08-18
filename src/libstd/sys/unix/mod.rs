@@ -12,8 +12,6 @@
 
 use io::{self, ErrorKind};
 use libc;
-use num::One;
-use ops::Neg;
 
 #[cfg(target_os = "android")]   pub use os::android as platform;
 #[cfg(target_os = "bitrig")]    pub use os::bitrig as platform;
@@ -32,6 +30,7 @@ use ops::Neg;
 pub mod weak;
 
 pub mod android;
+#[cfg(any(not(cargobuild), feature = "backtrace"))]
 pub mod backtrace;
 pub mod condvar;
 pub mod ext;
@@ -84,11 +83,11 @@ pub fn init() {
         }
     }
 
-    #[cfg(not(target_os = "nacl"))]
+    #[cfg(not(any(target_os = "nacl", target_os = "emscripten")))]
     unsafe fn reset_sigpipe() {
         assert!(signal(libc::SIGPIPE, libc::SIG_IGN) != !0);
     }
-    #[cfg(target_os = "nacl")]
+    #[cfg(any(target_os = "nacl", target_os = "emscripten"))]
     unsafe fn reset_sigpipe() {}
 }
 
@@ -123,9 +122,23 @@ pub fn decode_error_kind(errno: i32) -> ErrorKind {
     }
 }
 
-pub fn cvt<T: One + PartialEq + Neg<Output=T>>(t: T) -> io::Result<T> {
-    let one: T = T::one();
-    if t == -one {
+#[doc(hidden)]
+pub trait IsMinusOne {
+    fn is_minus_one(&self) -> bool;
+}
+
+macro_rules! impl_is_minus_one {
+    ($($t:ident)*) => ($(impl IsMinusOne for $t {
+        fn is_minus_one(&self) -> bool {
+            *self == -1
+        }
+    })*)
+}
+
+impl_is_minus_one! { i8 i16 i32 i64 isize }
+
+pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
+    if t.is_minus_one() {
         Err(io::Error::last_os_error())
     } else {
         Ok(t)
@@ -133,7 +146,8 @@ pub fn cvt<T: One + PartialEq + Neg<Output=T>>(t: T) -> io::Result<T> {
 }
 
 pub fn cvt_r<T, F>(mut f: F) -> io::Result<T>
-    where T: One + PartialEq + Neg<Output=T>, F: FnMut() -> T
+    where T: IsMinusOne,
+          F: FnMut() -> T
 {
     loop {
         match cvt(f()) {

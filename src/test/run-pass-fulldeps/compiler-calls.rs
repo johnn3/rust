@@ -19,11 +19,12 @@ extern crate getopts;
 extern crate rustc;
 extern crate rustc_driver;
 extern crate syntax;
+extern crate rustc_errors as errors;
 
 use rustc::session::Session;
 use rustc::session::config::{self, Input};
 use rustc_driver::{driver, CompilerCalls, Compilation};
-use syntax::{diagnostics, errors};
+use syntax::ast;
 
 use std::path::PathBuf;
 
@@ -35,7 +36,8 @@ impl<'a> CompilerCalls<'a> for TestCalls {
     fn early_callback(&mut self,
                       _: &getopts::Matches,
                       _: &config::Options,
-                      _: &diagnostics::registry::Registry,
+                      _: &ast::CrateConfig,
+                      _: &errors::registry::Registry,
                       _: config::ErrorOutputType)
                       -> Compilation {
         self.count *= 2;
@@ -45,6 +47,7 @@ impl<'a> CompilerCalls<'a> for TestCalls {
     fn late_callback(&mut self,
                      _: &getopts::Matches,
                      _: &Session,
+                     _: &ast::CrateConfig,
                      _: &Input,
                      _: &Option<PathBuf>,
                      _: &Option<PathBuf>)
@@ -62,9 +65,10 @@ impl<'a> CompilerCalls<'a> for TestCalls {
     fn no_input(&mut self,
                 _: &getopts::Matches,
                 _: &config::Options,
+                _: &ast::CrateConfig,
                 _: &Option<PathBuf>,
                 _: &Option<PathBuf>,
-                _: &diagnostics::registry::Registry)
+                _: &errors::registry::Registry)
                 -> Option<(Input, Option<PathBuf>)> {
         panic!("This shouldn't happen");
     }

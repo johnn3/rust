@@ -67,7 +67,7 @@ impl Socket {
             // this option, however, was added in 2.6.27, and we still support
             // 2.6.18 as a kernel, so if the returned error is EINVAL we
             // fallthrough to the fallback.
-            if cfg!(linux) {
+            if cfg!(target_os = "linux") {
                 match cvt(libc::socket(fam, ty | SOCK_CLOEXEC, 0)) {
                     Ok(fd) => return Ok(Socket(FileDesc::new(fd))),
                     Err(ref e) if e.raw_os_error() == Some(libc::EINVAL) => {}
@@ -77,7 +77,7 @@ impl Socket {
 
             let fd = cvt(libc::socket(fam, ty, 0))?;
             let fd = FileDesc::new(fd);
-            fd.set_cloexec();
+            fd.set_cloexec()?;
             Ok(Socket(fd))
         }
     }
@@ -87,7 +87,7 @@ impl Socket {
             let mut fds = [0, 0];
 
             // Like above, see if we can set cloexec atomically
-            if cfg!(linux) {
+            if cfg!(target_os = "linux") {
                 match cvt(libc::socketpair(fam, ty | SOCK_CLOEXEC, 0, fds.as_mut_ptr())) {
                     Ok(_) => {
                         return Ok((Socket(FileDesc::new(fds[0])), Socket(FileDesc::new(fds[1]))));
@@ -99,9 +99,9 @@ impl Socket {
 
             cvt(libc::socketpair(fam, ty, 0, fds.as_mut_ptr()))?;
             let a = FileDesc::new(fds[0]);
-            a.set_cloexec();
             let b = FileDesc::new(fds[1]);
-            b.set_cloexec();
+            a.set_cloexec()?;
+            b.set_cloexec()?;
             Ok((Socket(a), Socket(b)))
         }
     }
@@ -132,7 +132,7 @@ impl Socket {
             libc::accept(self.0.raw(), storage, len)
         })?;
         let fd = FileDesc::new(fd);
-        fd.set_cloexec();
+        fd.set_cloexec()?;
         Ok(Socket(fd))
     }
 

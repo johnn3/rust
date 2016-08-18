@@ -12,6 +12,7 @@
 
 #![allow(dead_code)]
 #![allow(unused_imports)]
+
 use self::HasTestSignature::*;
 
 use std::iter;
@@ -20,12 +21,15 @@ use std::mem;
 use std::vec;
 use attr::AttrMetaMethods;
 use attr;
-use codemap::{DUMMY_SP, Span, ExpnInfo, NameAndSpan, MacroAttribute};
-use codemap;
+use syntax_pos::{self, DUMMY_SP, NO_EXPANSION, Span, FileMap, BytePos};
+use std::rc::Rc;
+
+use codemap::{self, CodeMap, ExpnInfo, NameAndSpan, MacroAttribute};
 use errors;
+use errors::snippet::{SnippetData};
 use config;
 use entry::{self, EntryPointType};
-use ext::base::ExtCtxt;
+use ext::base::{ExtCtxt, DummyMacroLoader};
 use ext::build::AstBuilder;
 use ext::expand::ExpansionConfig;
 use fold::Folder;
@@ -81,7 +85,7 @@ pub fn modify_for_testing(sess: &ParseSess,
     if should_test {
         generate_test_harness(sess, reexport_test_harness_main, krate, span_diagnostic)
     } else {
-        strip_test_functions(krate)
+        krate
     }
 }
 
@@ -181,6 +185,8 @@ impl<'a> fold::Folder for TestHarnessGenerator<'a> {
 
         mod_folded
     }
+
+    fn fold_mac(&mut self, mac: ast::Mac) -> ast::Mac { mac }
 }
 
 struct EntryPointCleaner {
@@ -230,6 +236,8 @@ impl fold::Folder for EntryPointCleaner {
 
         SmallVector::one(folded)
     }
+
+    fn fold_mac(&mut self, mac: ast::Mac) -> ast::Mac { mac }
 }
 
 fn mk_reexport_mod(cx: &mut TestCtxt, tests: Vec<ast::Ident>,
@@ -270,13 +278,13 @@ fn generate_test_harness(sess: &ParseSess,
     let mut cleaner = EntryPointCleaner { depth: 0 };
     let krate = cleaner.fold_crate(krate);
 
-    let mut feature_gated_cfgs = vec![];
+    let mut loader = DummyMacroLoader;
     let mut cx: TestCtxt = TestCtxt {
         sess: sess,
         span_diagnostic: sd,
         ext_cx: ExtCtxt::new(sess, vec![],
                              ExpansionConfig::default("test".to_string()),
-                             &mut feature_gated_cfgs),
+                             &mut loader),
         path: Vec::new(),
         testfns: Vec::new(),
         reexport_test_harness_main: reexport_test_harness_main,
@@ -302,19 +310,6 @@ fn generate_test_harness(sess: &ParseSess,
     let res = fold.fold_crate(krate);
     fold.cx.ext_cx.bt_pop();
     return res;
-}
-
-fn strip_test_functions(krate: ast::Crate) -> ast::Crate {
-    // When not compiling with --test we should not compile the
-    // #[test] functions
-    struct StripTests;
-    impl config::CfgFolder for StripTests {
-        fn in_cfg(&mut self, attrs: &[ast::Attribute]) -> bool {
-            !attr::contains_name(attrs, "test") && !attr::contains_name(attrs, "bench")
-        }
-    }
-
-    StripTests.fold_crate(krate)
 }
 
 /// Craft a span that will be ignored by the stability lint's
@@ -487,7 +482,7 @@ fn mk_main(cx: &mut TestCtxt) -> P<ast::Item> {
     let main_attr = ecx.attribute(sp, main_meta);
     // pub fn main() { ... }
     let main_ret_ty = ecx.ty(sp, ast::TyKind::Tup(vec![]));
-    let main_body = ecx.block_all(sp, vec![call_test_main], None);
+    let main_body = ecx.block(sp, vec![call_test_main]);
     let main = ast::ItemKind::Fn(ecx.fn_decl(vec![], main_ret_ty),
                            ast::Unsafety::Normal,
                            ast::Constness::NotConst,
@@ -617,10 +612,10 @@ fn mk_test_descs(cx: &TestCtxt) -> P<ast::Expr> {
                     mk_test_desc_and_fn_rec(cx, test)
                 }).collect()),
                 span: DUMMY_SP,
-                attrs: None,
+                attrs: ast::ThinVec::new(),
             })),
         span: DUMMY_SP,
-        attrs: None,
+        attrs: ast::ThinVec::new(),
     })
 }
 

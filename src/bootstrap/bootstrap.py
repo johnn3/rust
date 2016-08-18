@@ -10,6 +10,7 @@
 
 import argparse
 import contextlib
+import datetime
 import hashlib
 import os
 import shutil
@@ -17,6 +18,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+
+from time import time
 
 
 def get(url, path, verbose=False):
@@ -28,8 +31,16 @@ def get(url, path, verbose=False):
 
     try:
         download(sha_path, sha_url, verbose)
+        if os.path.exists(path):
+            if verify(path, sha_path, False):
+                print("using already-download file " + path)
+                return
+            else:
+                print("ignoring already-download file " + path + " due to failed verification")
+                os.unlink(path)
         download(temp_path, url, verbose)
-        verify(temp_path, sha_path, verbose)
+        if not verify(temp_path, sha_path, True):
+            raise RuntimeError("failed verification")
         print("moving {} to {}".format(temp_path, path))
         shutil.move(temp_path, path)
     finally:
@@ -61,13 +72,12 @@ def verify(path, sha_path, verbose):
         found = hashlib.sha256(f.read()).hexdigest()
     with open(sha_path, "r") as f:
         expected, _ = f.readline().split()
-    if found != expected:
-        err = ("invalid checksum:\n"
+    verified = found == expected
+    if not verified and verbose:
+        print("invalid checksum:\n"
                "    found:    {}\n"
                "    expected: {}".format(found, expected))
-        if verbose:
-            raise RuntimeError(err)
-        sys.exit(err)
+    return verified
 
 
 def unpack(tarball, dst, verbose=False, match=None):
@@ -117,6 +127,9 @@ def stage0_data(rust_root):
             a, b = line.split(": ", 1)
             data[a] = b
     return data
+
+def format_build_time(duration):
+    return str(datetime.timedelta(seconds=int(duration)))
 
 class RustBuild:
     def download_stage0(self):
@@ -265,7 +278,7 @@ class RustBuild:
         try:
             ostype = subprocess.check_output(['uname', '-s']).strip()
             cputype = subprocess.check_output(['uname', '-m']).strip()
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, WindowsError):
             if sys.platform == 'win32':
                 return 'x86_64-pc-windows-msvc'
             err = "uname not found"
@@ -346,7 +359,7 @@ def main():
     parser.add_argument('--clean', action='store_true')
     parser.add_argument('-v', '--verbose', action='store_true')
 
-    args = [a for a in sys.argv if a != '-h']
+    args = [a for a in sys.argv if a != '-h' and a != '--help']
     args, _ = parser.parse_known_args(args)
 
     # Configure initial bootstrap
@@ -372,6 +385,8 @@ def main():
     rb._rustc_channel, rb._rustc_date = data['rustc'].split('-', 1)
     rb._cargo_channel, rb._cargo_date = data['cargo'].split('-', 1)
 
+    start_time = time()
+
     # Fetch/build the bootstrap
     rb.build = rb.build_triple()
     rb.download_stage0()
@@ -389,6 +404,10 @@ def main():
     env = os.environ.copy()
     env["BOOTSTRAP_PARENT_ID"] = str(os.getpid())
     rb.run(args, env)
+
+    end_time = time()
+
+    print("Build completed in %s" % format_build_time(end_time - start_time))
 
 if __name__ == '__main__':
     main()

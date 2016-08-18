@@ -24,10 +24,10 @@ use rustc::ty::subst::Substs;
 use rustc::traits::{Obligation, SelectionContext};
 use util::nodemap::{FnvHashSet};
 
-
 use syntax::ast;
-use syntax::codemap::Span;
-use syntax::errors::DiagnosticBuilder;
+use errors::DiagnosticBuilder;
+use syntax_pos::Span;
+
 use rustc::hir::print as pprust;
 use rustc::hir;
 use rustc::hir::Expr_;
@@ -54,10 +54,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
                 self.autoderef(span, ty).any(|(ty, _)| self.probe(|_| {
                     let fn_once_substs =
-                        Substs::new_trait(vec![self.next_ty_var()], vec![], ty);
-                    let trait_ref =
-                        ty::TraitRef::new(fn_once,
-                                          tcx.mk_substs(fn_once_substs));
+                        Substs::new_trait(tcx, vec![self.next_ty_var()], vec![], ty);
+                    let trait_ref = ty::TraitRef::new(fn_once, fn_once_substs);
                     let poly_trait_ref = trait_ref.to_poly_trait_ref();
                     let obligation = Obligation::misc(span,
                                                       self.body_id,
@@ -160,29 +158,36 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                 item_name,
                                 actual)
                     },
-                    rcvr_ty,
-                    None);
+                    rcvr_ty);
 
-                // If the item has the name of a field, give a help note
-                if let (&ty::TyStruct(def, substs), Some(expr)) = (&rcvr_ty.sty, rcvr_expr) {
-                    if let Some(field) = def.struct_variant().find_field_named(item_name) {
-                        let expr_string = match tcx.sess.codemap().span_to_snippet(expr.span) {
-                            Ok(expr_string) => expr_string,
-                            _ => "s".into() // Default to a generic placeholder for the
-                                            // expression when we can't generate a string
-                                            // snippet
-                        };
+                // If the method name is the name of a field with a function or closure type,
+                // give a helping note that it has to be called as (x.f)(...).
+                if let Some(expr) = rcvr_expr {
+                    for (ty, _) in self.autoderef(span, rcvr_ty) {
+                        if let ty::TyStruct(def, substs) = ty.sty {
+                            if let Some(field) = def.struct_variant().find_field_named(item_name) {
+                                let snippet = tcx.sess.codemap().span_to_snippet(expr.span);
+                                let expr_string = match snippet {
+                                    Ok(expr_string) => expr_string,
+                                    _ => "s".into() // Default to a generic placeholder for the
+                                                    // expression when we can't generate a
+                                                    // string snippet
+                                };
 
-                        let field_ty = field.ty(tcx, substs);
+                                let field_ty = field.ty(tcx, substs);
 
-                        if self.is_fn_ty(&field_ty, span) {
-                            err.span_note(span,
-                                          &format!("use `({0}.{1})(...)` if you meant to call \
-                                                   the function stored in the `{1}` field",
-                                                   expr_string, item_name));
-                        } else {
-                            err.span_note(span, &format!("did you mean to write `{0}.{1}`?",
-                                                         expr_string, item_name));
+                                if self.is_fn_ty(&field_ty, span) {
+                                    err.span_note(span, &format!(
+                                        "use `({0}.{1})(...)` if you meant to call the function \
+                                         stored in the `{1}` field",
+                                        expr_string, item_name));
+                                } else {
+                                    err.span_note(span, &format!(
+                                        "did you mean to write `{0}.{1}`?",
+                                        expr_string, item_name));
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -351,7 +356,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             match ty.sty {
                 ty::TyEnum(def, _) | ty::TyStruct(def, _) => def.did.is_local(),
 
-                ty::TyTrait(ref tr) => tr.principal_def_id().is_local(),
+                ty::TyTrait(ref tr) => tr.principal.def_id().is_local(),
 
                 ty::TyParam(_) => true,
 

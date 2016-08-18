@@ -12,12 +12,10 @@ use llvm::ValueRef;
 use llvm;
 use rustc::hir::def_id::DefId;
 use rustc::infer::TransNormalize;
-use rustc::ty::subst;
 use rustc::ty::subst::{Subst, Substs};
 use rustc::ty::{self, Ty, TypeFoldable, TyCtxt};
 use attributes;
 use base::{push_ctxt};
-use base::trans_fn;
 use base;
 use common::*;
 use declare;
@@ -27,17 +25,16 @@ use rustc::util::ppaux;
 
 use rustc::hir;
 
-use syntax::attr;
-use syntax::errors;
+use errors;
 
 use std::fmt;
+use trans_item::TransItem;
 
 pub fn monomorphic_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
                                 fn_id: DefId,
-                                psubsts: &'tcx subst::Substs<'tcx>)
+                                psubsts: &'tcx Substs<'tcx>)
                                 -> (ValueRef, Ty<'tcx>) {
     debug!("monomorphic_fn(fn_id={:?}, real_substs={:?})", fn_id, psubsts);
-
     assert!(!psubsts.types.needs_infer() && !psubsts.types.has_param_types());
 
     let _icx = push_ctxt("monomorphic_fn");
@@ -50,12 +47,11 @@ pub fn monomorphic_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
     let mono_ty = apply_param_substs(ccx.tcx(), psubsts, &item_ty);
     debug!("mono_ty = {:?} (post-substitution)", mono_ty);
 
-    match ccx.instances().borrow().get(&instance) {
-        Some(&val) => {
-            debug!("leaving monomorphic fn {:?}", instance);
-            return (val, mono_ty);
-        }
-        None => ()
+    if let Some(&val) = ccx.instances().borrow().get(&instance) {
+        debug!("leaving monomorphic fn {:?}", instance);
+        return (val, mono_ty);
+    } else {
+        assert!(!ccx.codegen_unit().contains_item(&TransItem::Fn(instance)));
     }
 
     debug!("monomorphic_fn({:?})", instance);
@@ -87,9 +83,10 @@ pub fn monomorphic_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
         monomorphizing.insert(fn_id, depth + 1);
     }
 
-    let symbol = instance.symbol_name(ccx.shared());
+    let symbol = ccx.symbol_map().get_or_compute(ccx.shared(),
+                                                 TransItem::Fn(instance));
 
-    debug!("monomorphize_fn mangled to {}", symbol);
+    debug!("monomorphize_fn mangled to {}", &symbol);
     assert!(declare::get_defined_value(ccx, &symbol).is_none());
 
     // FIXME(nagisa): perhaps needs a more fine grained selection?
@@ -112,33 +109,37 @@ pub fn monomorphic_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
         });
     match map_node {
         hir_map::NodeItem(&hir::Item {
-            ref attrs, node: hir::ItemFn(ref decl, _, _, _, _, ref body), ..
-        }) |
-        hir_map::NodeTraitItem(&hir::TraitItem {
-            ref attrs, node: hir::MethodTraitItem(
-                hir::MethodSig { ref decl, .. }, Some(ref body)), ..
+            ref attrs,
+            node: hir::ItemFn(..), ..
         }) |
         hir_map::NodeImplItem(&hir::ImplItem {
             ref attrs, node: hir::ImplItemKind::Method(
-                hir::MethodSig { ref decl, .. }, ref body), ..
+                hir::MethodSig { .. }, _), ..
+        }) |
+        hir_map::NodeTraitItem(&hir::TraitItem {
+            ref attrs, node: hir::MethodTraitItem(
+                hir::MethodSig { .. }, Some(_)), ..
         }) => {
-            attributes::from_fn_attrs(ccx, attrs, lldecl);
+            let trans_item = TransItem::Fn(instance);
 
-            let is_first = !ccx.available_monomorphizations().borrow()
-                                                             .contains(&symbol);
-            if is_first {
-                ccx.available_monomorphizations().borrow_mut().insert(symbol.clone());
-            }
-
-            let trans_everywhere = attr::requests_inline(attrs);
-            if trans_everywhere || is_first {
-                let origin = if is_first { base::OriginalTranslation } else { base::InlinedCopy };
-                base::update_linkage(ccx, lldecl, None, origin);
-                trans_fn(ccx, decl, body, lldecl, psubsts, fn_node_id);
+            if ccx.shared().translation_items().borrow().contains(&trans_item) {
+                attributes::from_fn_attrs(ccx, attrs, lldecl);
+                unsafe {
+                    llvm::LLVMSetLinkage(lldecl, llvm::ExternalLinkage);
+                }
             } else {
-                // We marked the value as using internal linkage earlier, but that is illegal for
-                // declarations, so switch back to external linkage.
-                llvm::SetLinkage(lldecl, llvm::ExternalLinkage);
+                // FIXME: #34151
+                // Normally, getting here would indicate a bug in trans::collector,
+                // since it seems to have missed a translation item. When we are
+                // translating with non-MIR based trans, however, the results of
+                // the collector are not entirely reliable since it bases its
+                // analysis on MIR. Thus, we'll instantiate the missing function
+                // privately in this codegen unit, so that things keep working.
+                ccx.stats().n_fallback_instantiations.set(ccx.stats()
+                                                             .n_fallback_instantiations
+                                                             .get() + 1);
+                trans_item.predefine(ccx, llvm::InternalLinkage);
+                trans_item.define(ccx);
             }
         }
 
@@ -172,8 +173,7 @@ pub struct Instance<'tcx> {
 
 impl<'tcx> fmt::Display for Instance<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        ppaux::parameterized(f, &self.substs, self.def, ppaux::Ns::Value, &[],
-                             |tcx| Some(tcx.lookup_item_type(self.def).generics))
+        ppaux::parameterized(f, &self.substs, self.def, ppaux::Ns::Value, &[])
     }
 }
 

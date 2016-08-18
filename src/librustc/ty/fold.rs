@@ -40,7 +40,7 @@
 //! and does not need to visit anything else.
 
 use middle::region;
-use ty::subst;
+use ty::subst::Substs;
 use ty::adjustment;
 use ty::{self, Binder, Ty, TyCtxt, TypeFlags};
 
@@ -140,17 +140,13 @@ pub trait TypeFolder<'gcx: 'tcx, 'tcx> : Sized {
         t.super_fold_with(self)
     }
 
-    fn fold_trait_ref(&mut self, t: &ty::TraitRef<'tcx>) -> ty::TraitRef<'tcx> {
-        t.super_fold_with(self)
-    }
-
     fn fold_impl_header(&mut self, imp: &ty::ImplHeader<'tcx>) -> ty::ImplHeader<'tcx> {
         imp.super_fold_with(self)
     }
 
     fn fold_substs(&mut self,
-                   substs: &'tcx subst::Substs<'tcx>)
-                   -> &'tcx subst::Substs<'tcx> {
+                   substs: &'tcx Substs<'tcx>)
+                   -> &'tcx Substs<'tcx> {
         substs.super_fold_with(self)
     }
 
@@ -158,12 +154,6 @@ pub trait TypeFolder<'gcx: 'tcx, 'tcx> : Sized {
                    sig: &ty::FnSig<'tcx>)
                    -> ty::FnSig<'tcx> {
         sig.super_fold_with(self)
-    }
-
-    fn fold_output(&mut self,
-                      output: &ty::FnOutput<'tcx>)
-                      -> ty::FnOutput<'tcx> {
-        output.super_fold_with(self)
     }
 
     fn fold_bare_fn_ty(&mut self,
@@ -181,11 +171,6 @@ pub trait TypeFolder<'gcx: 'tcx, 'tcx> : Sized {
 
     fn fold_region(&mut self, r: ty::Region) -> ty::Region {
         r.super_fold_with(self)
-    }
-
-    fn fold_existential_bounds(&mut self, s: &ty::ExistentialBounds<'tcx>)
-                               -> ty::ExistentialBounds<'tcx> {
-        s.super_fold_with(self)
     }
 
     fn fold_autoref(&mut self, ar: &adjustment::AutoRef<'tcx>)
@@ -521,9 +506,8 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             fn tcx<'b>(&'b self) -> TyCtxt<'b, 'gcx, 'tcx> { self.0 }
 
             fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-                match self.tcx().normalized_cache.borrow().get(&ty).cloned() {
-                    None => {}
-                    Some(u) => return u
+                if let Some(u) = self.tcx().normalized_cache.borrow().get(&ty).cloned() {
+                    return u;
                 }
 
                 // FIXME(eddyb) should local contexts have a cache too?
@@ -696,7 +680,7 @@ impl<'tcx> TypeVisitor<'tcx> for LateBoundRegionsCollector {
         // in the normalized form
         if self.just_constrained {
             match t.sty {
-                ty::TyProjection(..) => { return false; }
+                ty::TyProjection(..) | ty::TyAnon(..) => { return false; }
                 _ => { }
             }
         }
@@ -714,4 +698,3 @@ impl<'tcx> TypeVisitor<'tcx> for LateBoundRegionsCollector {
         false
     }
 }
-

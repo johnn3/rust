@@ -99,11 +99,9 @@ pub struct CString {
 ///
 /// extern { fn my_string() -> *const c_char; }
 ///
-/// fn main() {
-///     unsafe {
-///         let slice = CStr::from_ptr(my_string());
-///         println!("string length: {}", slice.to_bytes().len());
-///     }
+/// unsafe {
+///     let slice = CStr::from_ptr(my_string());
+///     println!("string length: {}", slice.to_bytes().len());
 /// }
 /// ```
 ///
@@ -119,10 +117,8 @@ pub struct CString {
 ///     unsafe { work_with(data.as_ptr()) }
 /// }
 ///
-/// fn main() {
-///     let s = CString::new("data data data data").unwrap();
-///     work(&s);
-/// }
+/// let s = CString::new("data data data data").unwrap();
+/// work(&s);
 /// ```
 ///
 /// Converting a foreign C string into a Rust `String`
@@ -139,9 +135,7 @@ pub struct CString {
 ///     }
 /// }
 ///
-/// fn main() {
-///     println!("string: {}", my_string_safe());
-/// }
+/// println!("string: {}", my_string_safe());
 /// ```
 #[derive(Hash)]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -188,11 +182,9 @@ impl CString {
     ///
     /// extern { fn puts(s: *const c_char); }
     ///
-    /// fn main() {
-    ///     let to_print = CString::new("Hello!").unwrap();
-    ///     unsafe {
-    ///         puts(to_print.as_ptr());
-    ///     }
+    /// let to_print = CString::new("Hello!").unwrap();
+    /// unsafe {
+    ///     puts(to_print.as_ptr());
     /// }
     /// ```
     ///
@@ -219,6 +211,17 @@ impl CString {
     /// This method is equivalent to `new` except that no runtime assertion
     /// is made that `v` contains no 0 bytes, and it requires an actual
     /// byte vector, not anything that can be converted to one with Into.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let raw = b"foo".to_vec();
+    /// unsafe {
+    ///     let c_string = CString::from_vec_unchecked(raw);
+    /// }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub unsafe fn from_vec_unchecked(mut v: Vec<u8>) -> CString {
         v.push(0);
@@ -356,11 +359,32 @@ impl Borrow<CStr> for CString {
 impl NulError {
     /// Returns the position of the nul byte in the slice that was provided to
     /// `CString::new`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let nul_error = CString::new("foo\0bar").unwrap_err();
+    /// assert_eq!(nul_error.nul_position(), 3);
+    ///
+    /// let nul_error = CString::new("foo bar\0").unwrap_err();
+    /// assert_eq!(nul_error.nul_position(), 7);
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn nul_position(&self) -> usize { self.0 }
 
     /// Consumes this error, returning the underlying vector of bytes which
     /// generated the error in the first place.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::ffi::CString;
+    ///
+    /// let nul_error = CString::new("foo\0bar").unwrap_err();
+    /// assert_eq!(nul_error.into_vec(), b"foo\0bar");
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn into_vec(self) -> Vec<u8> { self.1 }
 }
@@ -509,6 +533,38 @@ impl CStr {
     /// The returned pointer will be valid for as long as `self` is and points
     /// to a contiguous region of memory terminated with a 0 byte to represent
     /// the end of the string.
+    ///
+    /// **WARNING**
+    ///
+    /// It is your responsibility to make sure that the underlying memory is not
+    /// freed too early. For example, the following code will cause undefined
+    /// behaviour when `ptr` is used inside the `unsafe` block:
+    ///
+    /// ```no_run
+    /// use std::ffi::{CString};
+    ///
+    /// let ptr = CString::new("Hello").unwrap().as_ptr();
+    /// unsafe {
+    ///     // `ptr` is dangling
+    ///     *ptr;
+    /// }
+    /// ```
+    ///
+    /// This happens because the pointer returned by `as_ptr` does not carry any
+    /// lifetime information and the string is deallocated immediately after
+    /// the `CString::new("Hello").unwrap().as_ptr()` expression is evaluated.
+    /// To fix the problem, bind the string to a local variable:
+    ///
+    /// ```no_run
+    /// use std::ffi::{CString};
+    ///
+    /// let hello = CString::new("Hello").unwrap();
+    /// let ptr = hello.as_ptr();
+    /// unsafe {
+    ///     // `ptr` is valid because `hello` is in scope
+    ///     *ptr;
+    /// }
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn as_ptr(&self) -> *const c_char {
         self.inner.as_ptr()

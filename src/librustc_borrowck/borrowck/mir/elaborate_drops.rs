@@ -16,14 +16,14 @@ use super::{drop_flag_effects_for_location, on_all_children_bits};
 use super::{DropFlagState, MoveDataParamEnv};
 use super::patch::MirPatch;
 use rustc::ty::{self, Ty, TyCtxt};
-use rustc::ty::subst::{Subst, Substs, VecPerParamSpace};
+use rustc::ty::subst::{Subst, Substs};
 use rustc::mir::repr::*;
 use rustc::mir::transform::{Pass, MirPass, MirSource};
 use rustc::middle::const_val::ConstVal;
 use rustc::middle::lang_items;
 use rustc::util::nodemap::FnvHashMap;
-use rustc_mir::pretty;
-use syntax::codemap::Span;
+use rustc_data_structures::indexed_vec::Idx;
+use syntax_pos::Span;
 
 use std::fmt;
 use std::u32;
@@ -65,9 +65,7 @@ impl<'tcx> MirPass<'tcx> for ElaborateDrops {
                 patch: MirPatch::new(mir),
             }.elaborate()
         };
-        pretty::dump_mir(tcx, "elaborate_drops", &0, src, mir, None);
         elaborate_patch.apply(mir);
-        pretty::dump_mir(tcx, "elaborate_drops", &1, src, mir, None);
     }
 }
 
@@ -118,14 +116,13 @@ struct ElaborateDropsCtxt<'a, 'tcx: 'a> {
     env: &'a MoveDataParamEnv<'tcx>,
     flow_inits: DataflowResults<MaybeInitializedLvals<'a, 'tcx>>,
     flow_uninits:  DataflowResults<MaybeUninitializedLvals<'a, 'tcx>>,
-    drop_flags: FnvHashMap<MovePathIndex, u32>,
+    drop_flags: FnvHashMap<MovePathIndex, Temp>,
     patch: MirPatch<'tcx>,
 }
 
 #[derive(Copy, Clone, Debug)]
 struct DropCtxt<'a, 'tcx: 'a> {
-    span: Span,
-    scope: ScopeId,
+    source_info: SourceInfo,
     is_cleanup: bool,
 
     init_data: &'a InitializationData,
@@ -188,7 +185,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     {
         match self.move_data().move_paths[path].content {
             MovePathContent::Lvalue(ref lvalue) => {
-                let ty = self.mir.lvalue_ty(self.tcx, lvalue).to_ty(self.tcx);
+                let ty = lvalue.ty(self.mir, self.tcx).to_ty(self.tcx);
                 debug!("path_needs_drop({:?}, {:?} : {:?})", path, lvalue, ty);
 
                 self.tcx.type_needs_drop_given_env(ty, self.param_env())
@@ -198,35 +195,24 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     /// Returns whether this lvalue is tracked by drop elaboration. This
-    /// includes all lvalues, except these behind references or arrays.
-    ///
-    /// Lvalues behind references or arrays are not tracked by elaboration
-    /// and are always assumed to be initialized when accessible. As
-    /// references and indexes can be reseated, trying to track them
-    /// can only lead to trouble.
+    /// includes all lvalues, except these (1.) behind references or arrays,
+    ///  or (2.) behind ADT's with a Drop impl.
     fn lvalue_is_tracked(&self, lv: &Lvalue<'tcx>) -> bool
     {
+        // `lvalue_contents_drop_state_cannot_differ` only compares
+        // the `lv` to its immediate contents, while this recursively
+        // follows parent chain formed by `base` of each projection.
         if let &Lvalue::Projection(ref data) = lv {
-            self.lvalue_contents_are_tracked(&data.base)
+            !super::lvalue_contents_drop_state_cannot_differ(self.tcx, self.mir, &data.base) &&
+                self.lvalue_is_tracked(&data.base)
         } else {
             true
         }
     }
 
-    fn lvalue_contents_are_tracked(&self, lv: &Lvalue<'tcx>) -> bool {
-        let ty = self.mir.lvalue_ty(self.tcx, lv).to_ty(self.tcx);
-        match ty.sty {
-            ty::TyArray(..) | ty::TySlice(..) | ty::TyRef(..) | ty::TyRawPtr(..) => {
-                false
-            }
-            _ => self.lvalue_is_tracked(lv)
-        }
-    }
-
     fn collect_drop_flags(&mut self)
     {
-        for bb in self.mir.all_basic_blocks() {
-            let data = self.mir.basic_block_data(bb);
+        for (bb, data) in self.mir.basic_blocks().iter_enumerated() {
             let terminator = data.terminator();
             let location = match terminator.kind {
                 TerminatorKind::Drop { ref location, .. } |
@@ -262,8 +248,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
 
     fn elaborate_drops(&mut self)
     {
-        for bb in self.mir.all_basic_blocks() {
-            let data = self.mir.basic_block_data(bb);
+        for (bb, data) in self.mir.basic_blocks().iter_enumerated() {
             let loc = Location { block: bb, index: data.statements.len() };
             let terminator = data.terminator();
 
@@ -273,8 +258,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                     let init_data = self.initialization_data_at(loc);
                     let path = self.move_data().rev_lookup.find(location);
                     self.elaborate_drop(&DropCtxt {
-                        span: terminator.span,
-                        scope: terminator.scope,
+                        source_info: terminator.source_info,
                         is_cleanup: data.is_cleanup,
                         init_data: &init_data,
                         lvalue: location,
@@ -324,13 +308,12 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         unwind: Option<BasicBlock>)
     {
         let bb = loc.block;
-        let data = self.mir.basic_block_data(bb);
+        let data = &self.mir[bb];
         let terminator = data.terminator();
 
         let assign = Statement {
             kind: StatementKind::Assign(location.clone(), Rvalue::Use(value.clone())),
-            span: terminator.span,
-            scope: terminator.scope
+            source_info: terminator.source_info
         };
 
         let unwind = unwind.unwrap_or(self.patch.resume_block());
@@ -367,8 +350,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
             let path = self.move_data().rev_lookup.find(location);
 
             self.elaborate_drop(&DropCtxt {
-                span: terminator.span,
-                scope: terminator.scope,
+                source_info: terminator.source_info,
                 is_cleanup: data.is_cleanup,
                 init_data: &init_data,
                 lvalue: location,
@@ -513,8 +495,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                     debug!("drop_ladder: for std field {} ({:?})", i, lv);
 
                     self.elaborated_drop_block(&DropCtxt {
-                        span: c.span,
-                        scope: c.scope,
+                        source_info: c.source_info,
                         is_cleanup: is_cleanup,
                         init_data: c.init_data,
                         lvalue: lv,
@@ -527,8 +508,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                     debug!("drop_ladder: for rest field {} ({:?})", i, lv);
 
                     let blk = self.complete_drop(&DropCtxt {
-                        span: c.span,
-                        scope: c.scope,
+                        source_info: c.source_info,
                         is_cleanup: is_cleanup,
                         init_data: c.init_data,
                         lvalue: lv,
@@ -568,17 +548,26 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     ///     ELAB(drop location.2 [target=`c.unwind])
     fn drop_ladder<'a>(&mut self,
                        c: &DropCtxt<'a, 'tcx>,
-                       fields: &[(Lvalue<'tcx>, Option<MovePathIndex>)])
+                       fields: Vec<(Lvalue<'tcx>, Option<MovePathIndex>)>)
                        -> BasicBlock
     {
         debug!("drop_ladder({:?}, {:?})", c, fields);
+
+        let mut fields = fields;
+        fields.retain(|&(ref lvalue, _)| {
+            let ty = lvalue.ty(self.mir, self.tcx).to_ty(self.tcx);
+            self.tcx.type_needs_drop_given_env(ty, self.param_env())
+        });
+
+        debug!("drop_ladder - fields needing drop: {:?}", fields);
+
         let unwind_ladder = if c.is_cleanup {
             None
         } else {
             Some(self.drop_halfladder(c, None, c.unwind.unwrap(), &fields, true))
         };
 
-        self.drop_halfladder(c, unwind_ladder, c.succ, fields, c.is_cleanup)
+        self.drop_halfladder(c, unwind_ladder, c.succ, &fields, c.is_cleanup)
             .last().cloned().unwrap_or(c.succ)
     }
 
@@ -587,7 +576,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     {
         debug!("open_drop_for_tuple({:?}, {:?})", c, tys);
 
-        let fields: Vec<_> = tys.iter().enumerate().map(|(i, &ty)| {
+        let fields = tys.iter().enumerate().map(|(i, &ty)| {
             (c.lvalue.clone().field(Field::new(i), ty),
              super::move_path_children_matching(
                  &self.move_data().move_paths, c.path, |proj| match proj {
@@ -599,7 +588,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
             ))
         }).collect();
 
-        self.drop_ladder(c, &fields)
+        self.drop_ladder(c, fields)
     }
 
     fn open_drop_for_box<'a>(&mut self, c: &DropCtxt<'a, 'tcx>, ty: Ty<'tcx>)
@@ -654,7 +643,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                 variant_path,
                 &adt.variants[variant_index],
                 substs);
-            self.drop_ladder(c, &fields)
+            self.drop_ladder(c, fields)
         } else {
             // variant not found - drop the entire enum
             if let None = *drop_block {
@@ -679,7 +668,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                     &adt.variants[0],
                     substs
                 );
-                self.drop_ladder(c, &fields)
+                self.drop_ladder(c, fields)
             }
             _ => {
                 let variant_drops : Vec<BasicBlock> =
@@ -717,7 +706,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     /// This creates a "drop ladder" that drops the needed fields of the
     /// ADT, both in the success case or if one of the destructors fail.
     fn open_drop<'a>(&mut self, c: &DropCtxt<'a, 'tcx>) -> BasicBlock {
-        let ty = self.mir.lvalue_ty(self.tcx, c.lvalue).to_ty(self.tcx);
+        let ty = c.lvalue.ty(self.mir, self.tcx).to_ty(self.tcx);
         match ty.sty {
             ty::TyStruct(def, substs) | ty::TyEnum(def, substs) => {
                 self.open_drop_for_adt(c, def, substs)
@@ -785,7 +774,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         self.patch.new_block(BasicBlockData {
             statements: vec![],
             terminator: Some(Terminator {
-                scope: c.scope, span: c.span, kind: k
+                source_info: c.source_info, kind: k
             }),
             is_cleanup: is_cleanup
         })
@@ -858,11 +847,10 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         let mut statements = vec![];
         if let Some(&flag) = self.drop_flags.get(&c.path) {
             statements.push(Statement {
-                span: c.span,
-                scope: c.scope,
+                source_info: c.source_info,
                 kind: StatementKind::Assign(
                     Lvalue::Temp(flag),
-                    self.constant_bool(c.span, false)
+                    self.constant_bool(c.source_info.span, false)
                 )
             });
         }
@@ -871,18 +859,15 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         let unit_temp = Lvalue::Temp(self.patch.new_temp(tcx.mk_nil()));
         let free_func = tcx.lang_items.require(lang_items::BoxFreeFnLangItem)
             .unwrap_or_else(|e| tcx.sess.fatal(&e));
-        let substs = tcx.mk_substs(Substs::new(
-            VecPerParamSpace::new(vec![], vec![], vec![ty]),
-            VecPerParamSpace::new(vec![], vec![], vec![])
-        ));
+        let substs = Substs::new(tcx, vec![ty], vec![]);
         let fty = tcx.lookup_item_type(free_func).ty.subst(tcx, substs);
 
         self.patch.new_block(BasicBlockData {
             statements: statements,
             terminator: Some(Terminator {
-                scope: c.scope, span: c.span, kind: TerminatorKind::Call {
+                source_info: c.source_info, kind: TerminatorKind::Call {
                     func: Operand::Constant(Constant {
-                        span: c.span,
+                        span: c.source_info.span,
                         ty: fty,
                         literal: Literal::Item {
                             def_id: free_func,
@@ -904,13 +889,13 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         // dataflow can create unneeded children in some cases
         // - be sure to ignore them.
 
-        let ty = self.mir.lvalue_ty(self.tcx, c.lvalue).to_ty(self.tcx);
+        let ty = c.lvalue.ty(self.mir, self.tcx).to_ty(self.tcx);
 
         match ty.sty {
             ty::TyStruct(def, _) | ty::TyEnum(def, _) => {
                 if def.has_dtor() {
                     self.tcx.sess.span_warn(
-                        c.span,
+                        c.source_info.span,
                         &format!("dataflow bug??? moving out of type with dtor {:?}",
                                  c));
                     true
@@ -932,7 +917,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
 
     fn set_drop_flag(&mut self, loc: Location, path: MovePathIndex, val: DropFlagState) {
         if let Some(&flag) = self.drop_flags.get(&path) {
-            let span = self.patch.context_for_location(self.mir, loc).0;
+            let span = self.patch.source_info_for_location(self.mir, loc).span;
             let val = self.constant_bool(span, val.value());
             self.patch.add_assign(loc, Lvalue::Temp(flag), val);
         }
@@ -940,7 +925,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
 
     fn drop_flags_on_init(&mut self) {
         let loc = Location { block: START_BLOCK, index: 0 };
-        let span = self.patch.context_for_location(self.mir, loc).0;
+        let span = self.patch.source_info_for_location(self.mir, loc).span;
         let false_ = self.constant_bool(span, false);
         for flag in self.drop_flags.values() {
             self.patch.add_assign(loc, Lvalue::Temp(*flag), false_.clone());
@@ -948,8 +933,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn drop_flags_for_fn_rets(&mut self) {
-        for bb in self.mir.all_basic_blocks() {
-            let data = self.mir.basic_block_data(bb);
+        for (bb, data) in self.mir.basic_blocks().iter_enumerated() {
             if let TerminatorKind::Call {
                 destination: Some((ref lv, tgt)), cleanup: Some(_), ..
             } = data.terminator().kind {
@@ -981,8 +965,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         // drop flags by themselves, to avoid the drop flags being
         // clobbered before they are read.
 
-        for bb in self.mir.all_basic_blocks() {
-            let data = self.mir.basic_block_data(bb);
+        for (bb, data) in self.mir.basic_blocks().iter_enumerated() {
             debug!("drop_flags_for_locs({:?})", data);
             for i in 0..(data.statements.len()+1) {
                 debug!("drop_flag_for_locs: stmt {}", i);

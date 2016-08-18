@@ -86,7 +86,7 @@ pub fn parse_config(args: Vec<String> ) -> Config {
           reqopt("", "stage-id", "the target-stage identifier", "stageN-TARGET"),
           reqopt("", "mode", "which sort of compile tests to run",
                  "(compile-fail|parse-fail|run-fail|run-pass|\
-                  run-pass-valgrind|pretty|debug-info|incremental)"),
+                  run-pass-valgrind|pretty|debug-info|incremental|mir-opt)"),
           optflag("", "ignored", "run tests marked as ignored"),
           optopt("", "runtool", "supervisor program to run tests under \
                                  (eg. emulator, valgrind)", "PROGRAM"),
@@ -254,6 +254,17 @@ pub fn run_tests(config: &Config) {
 
     match config.mode {
         DebugInfoLldb => {
+            if let Some(lldb_version) = config.lldb_version.as_ref() {
+                if is_blacklisted_lldb_version(&lldb_version[..]) {
+                    println!("WARNING: The used version of LLDB ({}) has a \
+                              known issue that breaks debuginfo tests. See \
+                              issue #32520 for more information. Skipping all \
+                              LLDB-based tests!",
+                             lldb_version);
+                    return
+                }
+            }
+
             // Some older versions of LLDB seem to have problems with multiple
             // instances running in parallel, so only run one test thread at a
             // time.
@@ -299,6 +310,7 @@ pub fn test_opts(config: &Config) -> test::TestOpts {
             Err(_) => false
         },
         color: test::AutoColor,
+        test_threads: None,
     }
 }
 
@@ -523,4 +535,8 @@ fn extract_lldb_version(full_version_line: Option<String>) -> Option<String> {
         }
     }
     None
+}
+
+fn is_blacklisted_lldb_version(version: &str) -> bool {
+    version == "350"
 }

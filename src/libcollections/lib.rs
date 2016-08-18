@@ -33,12 +33,12 @@
 #![feature(allow_internal_unstable)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
+#![cfg_attr(not(test), feature(char_escape_debug))]
 #![feature(core_intrinsics)]
 #![feature(dropck_parametricity)]
 #![feature(fmt_internals)]
 #![feature(heap_api)]
 #![feature(inclusive_range)]
-#![feature(iter_arith)]
 #![feature(lang_items)]
 #![feature(nonzero)]
 #![feature(pattern)]
@@ -49,8 +49,6 @@
 #![feature(specialization)]
 #![feature(staged_api)]
 #![feature(step_by)]
-#![feature(str_char)]
-#![feature(unboxed_closures)]
 #![feature(unicode)]
 #![feature(unique)]
 #![feature(unsafe_no_drop_flag)]
@@ -105,12 +103,14 @@ pub mod vec_deque;
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub mod btree_map {
+    //! A map based on a B-Tree.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use btree::map::*;
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub mod btree_set {
+    //! A set based on a B-Tree.
     #[stable(feature = "rust1", since = "1.0.0")]
     pub use btree::set::*;
 }

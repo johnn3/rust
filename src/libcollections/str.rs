@@ -37,7 +37,7 @@ use boxed::Box;
 pub use core::str::{FromStr, Utf8Error};
 #[allow(deprecated)]
 #[stable(feature = "rust1", since = "1.0.0")]
-pub use core::str::{Lines, LinesAny, CharRange};
+pub use core::str::{Lines, LinesAny};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::str::{Split, RSplit};
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1695,6 +1695,14 @@ impl str {
         let mut s = String::with_capacity(self.len());
         s.extend(self.chars().flat_map(|c| c.to_uppercase()));
         return s;
+    }
+
+    /// Escapes each char in `s` with `char::escape_debug`.
+    #[unstable(feature = "str_escape",
+               reason = "return type may change to be an iterator",
+               issue = "27791")]
+    pub fn escape_debug(&self) -> String {
+        self.chars().flat_map(|c| c.escape_debug()).collect()
     }
 
     /// Escapes each char in `s` with `char::escape_default`.

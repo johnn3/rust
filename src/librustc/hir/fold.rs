@@ -14,9 +14,9 @@
 use hir::*;
 use syntax::ast::{Name, NodeId, DUMMY_NODE_ID, Attribute, Attribute_, MetaItem};
 use syntax::ast::MetaItemKind;
-use syntax::attr::ThinAttributesExt;
 use hir;
-use syntax::codemap::{respan, Span, Spanned};
+use syntax_pos::Span;
+use syntax::codemap::{respan, Spanned};
 use syntax::ptr::P;
 use syntax::parse::token::keywords;
 use syntax::util::move_map::MoveMap;
@@ -292,8 +292,11 @@ pub fn noop_fold_view_path<T: Folder>(view_path: P<ViewPath>, fld: &mut T) -> P<
     })
 }
 
-pub fn fold_attrs<T: Folder>(attrs: HirVec<Attribute>, fld: &mut T) -> HirVec<Attribute> {
-    attrs.move_flat_map(|x| fld.fold_attribute(x))
+pub fn fold_attrs<T, F>(attrs: T, fld: &mut F) -> T
+    where T: Into<Vec<Attribute>> + From<Vec<Attribute>>,
+          F: Folder,
+{
+    attrs.into().move_flat_map(|x| fld.fold_attribute(x)).into()
 }
 
 pub fn noop_fold_arm<T: Folder>(Arm { attrs, pats, guard, body }: Arm, fld: &mut T) -> Arm {
@@ -350,6 +353,7 @@ pub fn noop_fold_ty<T: Folder>(t: P<Ty>, fld: &mut T) -> P<Ty> {
                         }
                     }))
                 }
+                TyNever => node,
                 TyTup(tys) => TyTup(tys.move_map(|ty| fld.fold_ty(ty))),
                 TyPath(qself, path) => {
                     let qself = qself.map(|QSelf { ty, position }| {
@@ -371,6 +375,9 @@ pub fn noop_fold_ty<T: Folder>(t: P<Ty>, fld: &mut T) -> P<Ty> {
                 }
                 TyPolyTraitRef(bounds) => {
                     TyPolyTraitRef(bounds.move_map(|b| fld.fold_ty_param_bound(b)))
+                }
+                TyImplTrait(bounds) => {
+                    TyImplTrait(bounds.move_map(|b| fld.fold_ty_param_bound(b)))
                 }
             },
             span: fld.new_span(span),
@@ -461,7 +468,7 @@ pub fn noop_fold_local<T: Folder>(l: P<Local>, fld: &mut T) -> P<Local> {
             pat: fld.fold_pat(pat),
             init: init.map(|e| fld.fold_expr(e)),
             span: fld.new_span(span),
-            attrs: attrs.map_thin_attrs(|attrs| fold_attrs(attrs.into(), fld).into()),
+            attrs: fold_attrs(attrs, fld),
         }
     })
 }
@@ -509,7 +516,6 @@ pub fn noop_fold_fn_decl<T: Folder>(decl: P<FnDecl>, fld: &mut T) -> P<FnDecl> {
             output: match output {
                 Return(ty) => Return(fld.fold_ty(ty)),
                 DefaultReturn(span) => DefaultReturn(span),
-                NoReturn(span) => NoReturn(span),
             },
             variadic: variadic,
         }
@@ -927,12 +933,11 @@ pub fn noop_fold_pat<T: Folder>(p: P<Pat>, folder: &mut T) -> P<Pat> {
                     PatKind::TupleStruct(folder.fold_path(pth),
                             pats.move_map(|x| folder.fold_pat(x)), ddpos)
                 }
-                PatKind::Path(pth) => {
-                    PatKind::Path(folder.fold_path(pth))
-                }
-                PatKind::QPath(qself, pth) => {
-                    let qself = QSelf { ty: folder.fold_ty(qself.ty), ..qself };
-                    PatKind::QPath(qself, folder.fold_path(pth))
+                PatKind::Path(opt_qself, pth) => {
+                    let opt_qself = opt_qself.map(|qself| {
+                        QSelf { ty: folder.fold_ty(qself.ty), position: qself.position }
+                    });
+                    PatKind::Path(opt_qself, folder.fold_path(pth))
                 }
                 PatKind::Struct(pth, fields, etc) => {
                     let pth = folder.fold_path(pth);
@@ -1078,7 +1083,7 @@ pub fn noop_fold_expr<T: Folder>(Expr { id, node, span, attrs }: Expr, folder: &
             }
         },
         span: folder.new_span(span),
-        attrs: attrs.map_thin_attrs(|attrs| fold_attrs(attrs.into(), folder).into()),
+        attrs: fold_attrs(attrs, folder),
     }
 }
 

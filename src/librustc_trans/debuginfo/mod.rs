@@ -17,8 +17,7 @@ use self::VariableKind::*;
 use self::utils::{DIB, span_start, create_DIArray, is_node_local_to_unit};
 use self::namespace::mangled_name_of_item;
 use self::type_names::compute_debuginfo_type_name;
-use self::metadata::{type_metadata, diverging_type_metadata};
-use self::metadata::{file_metadata, scope_metadata, TypeMap, compile_unit_metadata};
+use self::metadata::{type_metadata, file_metadata, TypeMap};
 use self::source_loc::InternalDebugLocation::{self, UnknownLocation};
 
 use llvm;
@@ -32,6 +31,7 @@ use rustc::hir;
 
 use abi::Abi;
 use common::{NodeIdAndSpan, CrateContext, FunctionContext, Block, BlockAndBuilder};
+use inline;
 use monomorphize::{self, Instance};
 use rustc::ty::{self, Ty};
 use session::config::{self, FullDebugInfo, LimitedDebugInfo, NoDebugInfo};
@@ -42,15 +42,15 @@ use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::ptr;
 
-use syntax::codemap::{Span, Pos};
-use syntax::{ast, codemap};
+use syntax_pos::{self, Span, Pos};
+use syntax::ast;
 use syntax::attr::IntType;
 
 pub mod gdb;
 mod utils;
 mod namespace;
 mod type_names;
-mod metadata;
+pub mod metadata;
 mod create_scope_map;
 mod source_loc;
 
@@ -88,7 +88,7 @@ pub struct CrateDebugContext<'tcx> {
 impl<'tcx> CrateDebugContext<'tcx> {
     pub fn new(llmod: ModuleRef) -> CrateDebugContext<'tcx> {
         debug!("CrateDebugContext::new");
-        let builder = unsafe { llvm::LLVMDIBuilderCreate(llmod) };
+        let builder = unsafe { llvm::LLVMRustDIBuilderCreate(llmod) };
         // DIBuilder inherits context from the module, so we'd better use the same one
         let llcontext = unsafe { llvm::LLVMGetModuleContext(llmod) };
         return CrateDebugContext {
@@ -168,7 +168,6 @@ pub fn finalize(cx: &CrateContext) {
     }
 
     debug!("finalize");
-    let _ = compile_unit_metadata(cx);
 
     if gdb::needs_gdb_debug_scripts_section(cx) {
         // Add a .debug_gdb_scripts section to this compile-unit. This will
@@ -179,8 +178,8 @@ pub fn finalize(cx: &CrateContext) {
     }
 
     unsafe {
-        llvm::LLVMDIBuilderFinalize(DIB(cx));
-        llvm::LLVMDIBuilderDispose(DIB(cx));
+        llvm::LLVMRustDIBuilderFinalize(DIB(cx));
+        llvm::LLVMRustDIBuilderDispose(DIB(cx));
         // Debuginfo generation in LLVM by default uses a higher
         // version of dwarf than OS X currently understands. We can
         // instruct LLVM to emit an older version of dwarf, however,
@@ -239,19 +238,20 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
     // Do this here already, in case we do an early exit from this function.
     source_loc::set_debug_location(cx, None, UnknownLocation);
 
+    let instance = inline::maybe_inline_instance(cx, instance);
     let (containing_scope, span) = get_containing_scope_and_span(cx, instance);
 
     // This can be the case for functions inlined from another crate
-    if span == codemap::DUMMY_SP {
+    if span == syntax_pos::DUMMY_SP {
         return FunctionDebugContext::FunctionWithoutDebugInfo;
     }
 
     let loc = span_start(cx, span);
-    let file_metadata = file_metadata(cx, &loc.file.name);
+    let file_metadata = file_metadata(cx, &loc.file.name, &loc.file.abs_path);
 
     let function_type_metadata = unsafe {
         let fn_signature = get_function_signature(cx, sig, abi);
-        llvm::LLVMDIBuilderCreateSubroutineType(DIB(cx), file_metadata, fn_signature)
+        llvm::LLVMRustDIBuilderCreateSubroutineType(DIB(cx), file_metadata, fn_signature)
     };
 
     // Find the enclosing function, in case this is a closure.
@@ -266,7 +266,7 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
 
     // Get_template_parameters() will append a `<...>` clause to the function
     // name if necessary.
-    let generics = cx.tcx().lookup_item_type(fn_def_id).generics;
+    let generics = cx.tcx().lookup_generics(fn_def_id);
     let template_parameters = get_template_parameters(cx,
                                                       &generics,
                                                       instance.substs,
@@ -285,7 +285,7 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
     let linkage_name = CString::new(linkage_name).unwrap();
 
     let fn_metadata = unsafe {
-        llvm::LLVMDIBuilderCreateFunction(
+        llvm::LLVMRustDIBuilderCreateFunction(
             DIB(cx),
             containing_scope,
             function_name.as_ptr(),
@@ -324,12 +324,9 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         let mut signature = Vec::with_capacity(sig.inputs.len() + 1);
 
         // Return type -- llvm::DIBuilder wants this at index 0
-        signature.push(match sig.output {
-            ty::FnConverging(ret_ty) => match ret_ty.sty {
-                ty::TyTuple(ref tys) if tys.is_empty() => ptr::null_mut(),
-                _ => type_metadata(cx, ret_ty, codemap::DUMMY_SP)
-            },
-            ty::FnDiverging => diverging_type_metadata(cx)
+        signature.push(match sig.output.sty {
+            ty::TyTuple(ref tys) if tys.is_empty() => ptr::null_mut(),
+            _ => type_metadata(cx, sig.output, syntax_pos::DUMMY_SP)
         });
 
         let inputs = if abi == Abi::RustCall {
@@ -340,13 +337,13 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
 
         // Arguments types
         for &argument_type in inputs {
-            signature.push(type_metadata(cx, argument_type, codemap::DUMMY_SP));
+            signature.push(type_metadata(cx, argument_type, syntax_pos::DUMMY_SP));
         }
 
         if abi == Abi::RustCall && !sig.inputs.is_empty() {
             if let ty::TyTuple(args) = sig.inputs[sig.inputs.len() - 1].sty {
                 for &argument_type in args {
-                    signature.push(type_metadata(cx, argument_type, codemap::DUMMY_SP));
+                    signature.push(type_metadata(cx, argument_type, syntax_pos::DUMMY_SP));
                 }
             }
         }
@@ -361,7 +358,7 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                                          name_to_append_suffix_to: &mut String)
                                          -> DIArray
     {
-        let actual_types = param_substs.types.as_slice();
+        let actual_types = &param_substs.types;
 
         if actual_types.is_empty() {
             return create_DIArray(DIB(cx), &[]);
@@ -384,12 +381,13 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
 
         // Again, only create type information if full debuginfo is enabled
         let template_params: Vec<_> = if cx.sess().opts.debuginfo == FullDebugInfo {
-            generics.types.as_slice().iter().enumerate().map(|(i, param)| {
-                let actual_type = cx.tcx().normalize_associated_type(&actual_types[i]);
-                let actual_type_metadata = type_metadata(cx, actual_type, codemap::DUMMY_SP);
-                let name = CString::new(param.name.as_str().as_bytes()).unwrap();
+            let names = get_type_parameter_names(cx, generics);
+            actual_types.iter().zip(names).map(|(ty, name)| {
+                let actual_type = cx.tcx().normalize_associated_type(ty);
+                let actual_type_metadata = type_metadata(cx, actual_type, syntax_pos::DUMMY_SP);
+                let name = CString::new(name.as_str().as_bytes()).unwrap();
                 unsafe {
-                    llvm::LLVMDIBuilderCreateTemplateTypeParameter(
+                    llvm::LLVMRustDIBuilderCreateTemplateTypeParameter(
                         DIB(cx),
                         ptr::null_mut(),
                         name.as_ptr(),
@@ -406,6 +404,16 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         return create_DIArray(DIB(cx), &template_params[..]);
     }
 
+    fn get_type_parameter_names<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
+                                          generics: &ty::Generics<'tcx>)
+                                          -> Vec<ast::Name> {
+        let mut names = generics.parent.map_or(vec![], |def_id| {
+            get_type_parameter_names(cx, cx.tcx().lookup_generics(def_id))
+        });
+        names.extend(generics.types.iter().map(|param| param.name));
+        names
+    }
+
     fn get_containing_scope_and_span<'ccx, 'tcx>(cx: &CrateContext<'ccx, 'tcx>,
                                                  instance: Instance<'tcx>)
                                                  -> (DIScope, Span) {
@@ -420,7 +428,7 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                 let impl_self_ty = monomorphize::apply_param_substs(cx.tcx(),
                                                                     instance.substs,
                                                                     &impl_self_ty);
-                Some(type_metadata(cx, impl_self_ty, codemap::DUMMY_SP))
+                Some(type_metadata(cx, impl_self_ty, syntax_pos::DUMMY_SP))
             } else {
                 // For trait method impls we still use the "parallel namespace"
                 // strategy
@@ -439,10 +447,9 @@ pub fn create_function_debug_context<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         });
 
         // Try to get some span information, if we have an inlined item.
-        let definition_span = match cx.external().borrow().get(&instance.def) {
-            Some(&Some(node_id)) => cx.tcx().map.span(node_id),
-            _ => cx.tcx().map.def_id_span(instance.def, codemap::DUMMY_SP)
-        };
+        let definition_span = cx.tcx()
+                                .map
+                                .def_id_span(instance.def, syntax_pos::DUMMY_SP);
 
         (containing_scope, definition_span)
     }
@@ -476,8 +483,9 @@ pub fn declare_local<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                                  span: Span) {
     let cx: &CrateContext = bcx.ccx();
 
-    let filename = span_start(cx, span).file.name.clone();
-    let file_metadata = file_metadata(cx, &filename[..]);
+    let file = span_start(cx, span).file;
+    let filename = file.name.clone();
+    let file_metadata = file_metadata(cx, &filename[..], &file.abs_path);
 
     let loc = span_start(cx, span);
     let type_metadata = type_metadata(cx, variable_type, span);
@@ -493,7 +501,7 @@ pub fn declare_local<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
         (DirectVariable { alloca }, address_operations) |
         (IndirectVariable {alloca, address_operations}, _) => {
             let metadata = unsafe {
-                llvm::LLVMDIBuilderCreateVariable(
+                llvm::LLVMRustDIBuilderCreateVariable(
                     DIB(cx),
                     dwarf_tag,
                     scope_metadata,
@@ -511,7 +519,7 @@ pub fn declare_local<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                 InternalDebugLocation::new(scope_metadata, loc.line, loc.col.to_usize()));
             unsafe {
                 let debug_loc = llvm::LLVMGetCurrentDebugLocation(cx.raw_builder());
-                let instr = llvm::LLVMDIBuilderInsertDeclareAtEnd(
+                let instr = llvm::LLVMRustDIBuilderInsertDeclareAtEnd(
                     DIB(cx),
                     alloca,
                     metadata,

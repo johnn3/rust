@@ -10,16 +10,15 @@
 
 use hair::*;
 use hair::cx::Cx;
-use rustc_data_structures::fnv::FnvHashMap;
+use rustc_data_structures::indexed_vec::Idx;
 use rustc_const_eval as const_eval;
 use rustc::hir::def::Def;
-use rustc::hir::pat_util::{EnumerateAndAdjustIterator, pat_is_resolved_const};
+use rustc::hir::pat_util::EnumerateAndAdjustIterator;
 use rustc::ty::{self, Ty};
 use rustc::mir::repr::*;
 use rustc::hir::{self, PatKind};
-use syntax::ast;
-use syntax::codemap::Span;
 use syntax::ptr::P;
+use syntax_pos::Span;
 
 /// When there are multiple patterns in a single arm, each one has its
 /// own node-ids for the bindings.  References to the variables always
@@ -36,29 +35,25 @@ use syntax::ptr::P;
 /// ```
 struct PatCx<'patcx, 'cx: 'patcx, 'gcx: 'cx+'tcx, 'tcx: 'cx> {
     cx: &'patcx mut Cx<'cx, 'gcx, 'tcx>,
-    binding_map: Option<&'patcx FnvHashMap<ast::Name, ast::NodeId>>,
 }
 
 impl<'cx, 'gcx, 'tcx> Cx<'cx, 'gcx, 'tcx> {
     pub fn irrefutable_pat(&mut self, pat: &hir::Pat) -> Pattern<'tcx> {
-        PatCx::new(self, None).to_pattern(pat)
+        PatCx::new(self).to_pattern(pat)
     }
 
     pub fn refutable_pat(&mut self,
-                         binding_map: Option<&FnvHashMap<ast::Name, ast::NodeId>>,
                          pat: &hir::Pat)
                          -> Pattern<'tcx> {
-        PatCx::new(self, binding_map).to_pattern(pat)
+        PatCx::new(self).to_pattern(pat)
     }
 }
 
 impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
-    fn new(cx: &'patcx mut Cx<'cx, 'gcx, 'tcx>,
-               binding_map: Option<&'patcx FnvHashMap<ast::Name, ast::NodeId>>)
+    fn new(cx: &'patcx mut Cx<'cx, 'gcx, 'tcx>)
                -> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
         PatCx {
             cx: cx,
-            binding_map: binding_map,
         }
     }
 
@@ -81,11 +76,8 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                 PatternKind::Range { lo: lo, hi: hi }
             },
 
-            PatKind::Path(..) | PatKind::QPath(..)
-                if pat_is_resolved_const(&self.cx.tcx.def_map.borrow(), pat) =>
-            {
-                let def = self.cx.tcx.def_map.borrow().get(&pat.id).unwrap().full_def();
-                match def {
+            PatKind::Path(..) => {
+                match self.cx.tcx.expect_def(pat.id) {
                     Def::Const(def_id) | Def::AssociatedConst(def_id) => {
                         let tcx = self.cx.tcx.global_tcx();
                         let substs = Some(self.cx.tcx.node_id_item_substs(pat.id).substs);
@@ -110,11 +102,9 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                             }
                         }
                     }
-                    _ =>
-                        span_bug!(
-                            pat.span,
-                            "def not a constant: {:?}",
-                            def),
+                    _ => {
+                        self.variant_or_leaf(pat, vec![])
+                    }
                 }
             }
 
@@ -168,10 +158,7 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
             }
 
             PatKind::Binding(bm, ref ident, ref sub) => {
-                let id = match self.binding_map {
-                    None => pat.id,
-                    Some(ref map) => map[&ident.node],
-                };
+                let id = self.cx.tcx.expect_def(pat.id).var_id();
                 let var_ty = self.cx.tcx.node_id_to_type(pat.id);
                 let region = match var_ty.sty {
                     ty::TyRef(&r, _) => Some(r),
@@ -208,18 +195,13 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                 }
             }
 
-            PatKind::Path(..) => {
-                self.variant_or_leaf(pat, vec![])
-            }
-
             PatKind::TupleStruct(_, ref subpatterns, ddpos) => {
                 let pat_ty = self.cx.tcx.node_id_to_type(pat.id);
                 let adt_def = match pat_ty.sty {
                     ty::TyStruct(adt_def, _) | ty::TyEnum(adt_def, _) => adt_def,
                     _ => span_bug!(pat.span, "tuple struct pattern not applied to struct or enum"),
                 };
-                let def = self.cx.tcx.def_map.borrow().get(&pat.id).unwrap().full_def();
-                let variant_def = adt_def.variant_of_def(def);
+                let variant_def = adt_def.variant_of_def(self.cx.tcx.expect_def(pat.id));
 
                 let subpatterns =
                         subpatterns.iter()
@@ -242,9 +224,7 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                             "struct pattern not applied to struct or enum");
                     }
                 };
-
-                let def = self.cx.tcx.def_map.borrow().get(&pat.id).unwrap().full_def();
-                let variant_def = adt_def.variant_of_def(def);
+                let variant_def = adt_def.variant_of_def(self.cx.tcx.expect_def(pat.id));
 
                 let subpatterns =
                     fields.iter()
@@ -264,10 +244,6 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                           .collect();
 
                 self.variant_or_leaf(pat, subpatterns)
-            }
-
-            PatKind::QPath(..) => {
-                span_bug!(pat.span, "unexpanded macro or bad constant etc");
             }
         };
 
@@ -323,8 +299,7 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                        pat: &hir::Pat,
                        subpatterns: Vec<FieldPattern<'tcx>>)
                        -> PatternKind<'tcx> {
-        let def = self.cx.tcx.def_map.borrow().get(&pat.id).unwrap().full_def();
-        match def {
+        match self.cx.tcx.expect_def(pat.id) {
             Def::Variant(enum_id, variant_id) => {
                 let adt_def = self.cx.tcx.lookup_adt_def(enum_id);
                 if adt_def.variants.len() > 1 {
@@ -338,11 +313,11 @@ impl<'patcx, 'cx, 'gcx, 'tcx> PatCx<'patcx, 'cx, 'gcx, 'tcx> {
                 }
             }
 
-            Def::Struct(..) | Def::TyAlias(..) => {
+            Def::Struct(..) | Def::TyAlias(..) | Def::AssociatedTy(..) => {
                 PatternKind::Leaf { subpatterns: subpatterns }
             }
 
-            _ => {
+            def => {
                 span_bug!(pat.span, "inappropriate def for pattern: {:?}", def);
             }
         }

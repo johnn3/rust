@@ -11,7 +11,6 @@
 //! Numeric traits and functions for the built-in numeric types.
 
 #![stable(feature = "rust1", since = "1.0.0")]
-#![allow(missing_docs)]
 
 use char::CharExt;
 use cmp::PartialOrd;
@@ -66,6 +65,34 @@ impl<T: fmt::Display> fmt::Display for Wrapping<T> {
     }
 }
 
+#[stable(feature = "wrapping_fmt", since = "1.11.0")]
+impl<T: fmt::Binary> fmt::Binary for Wrapping<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[stable(feature = "wrapping_fmt", since = "1.11.0")]
+impl<T: fmt::Octal> fmt::Octal for Wrapping<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[stable(feature = "wrapping_fmt", since = "1.11.0")]
+impl<T: fmt::LowerHex> fmt::LowerHex for Wrapping<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[stable(feature = "wrapping_fmt", since = "1.11.0")]
+impl<T: fmt::UpperHex> fmt::UpperHex for Wrapping<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 mod wrapping;
 
 // All these modules are technically private and only exposed for libcoretest:
@@ -81,6 +108,8 @@ pub mod diy_float;
 #[unstable(feature = "zero_one",
            reason = "unsure of placement, wants to use associated constants",
            issue = "27739")]
+#[rustc_deprecated(since = "1.11.0", reason = "no longer used for \
+                                               Iterator::sum")]
 pub trait Zero: Sized {
     /// The "zero" (usually, additive identity) for this type.
     fn zero() -> Self;
@@ -93,6 +122,8 @@ pub trait Zero: Sized {
 #[unstable(feature = "zero_one",
            reason = "unsure of placement, wants to use associated constants",
            issue = "27739")]
+#[rustc_deprecated(since = "1.11.0", reason = "no longer used for \
+                                               Iterator::product")]
 pub trait One: Sized {
     /// The "one" (usually, multiplicative identity) for this type.
     fn one() -> Self;
@@ -103,6 +134,7 @@ macro_rules! zero_one_impl {
         #[unstable(feature = "zero_one",
                    reason = "unsure of placement, wants to use associated constants",
                    issue = "27739")]
+        #[allow(deprecated)]
         impl Zero for $t {
             #[inline]
             fn zero() -> Self { 0 }
@@ -110,6 +142,7 @@ macro_rules! zero_one_impl {
         #[unstable(feature = "zero_one",
                    reason = "unsure of placement, wants to use associated constants",
                    issue = "27739")]
+        #[allow(deprecated)]
         impl One for $t {
             #[inline]
             fn one() -> Self { 1 }
@@ -123,6 +156,7 @@ macro_rules! zero_one_impl_float {
         #[unstable(feature = "zero_one",
                    reason = "unsure of placement, wants to use associated constants",
                    issue = "27739")]
+        #[allow(deprecated)]
         impl Zero for $t {
             #[inline]
             fn zero() -> Self { 0.0 }
@@ -130,6 +164,7 @@ macro_rules! zero_one_impl_float {
         #[unstable(feature = "zero_one",
                    reason = "unsure of placement, wants to use associated constants",
                    issue = "27739")]
+        #[allow(deprecated)]
         impl One for $t {
             #[inline]
             fn one() -> Self { 1.0 }
@@ -152,6 +187,12 @@ macro_rules! int_impl {
      $sub_with_overflow:path,
      $mul_with_overflow:path) => {
         /// Returns the smallest value that can be represented by this integer type.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// assert_eq!(i8::min_value(), -128);
+        /// ```
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub const fn min_value() -> Self {
@@ -159,6 +200,12 @@ macro_rules! int_impl {
         }
 
         /// Returns the largest value that can be represented by this integer type.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// assert_eq!(i8::max_value(), 127);
+        /// ```
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub const fn max_value() -> Self {
@@ -252,6 +299,8 @@ macro_rules! int_impl {
         /// Shifts the bits to the left by a specified amount, `n`,
         /// wrapping the truncated bits to the end of the resulting integer.
         ///
+        /// Please note this isn't the same operation as `<<`!
+        ///
         /// # Examples
         ///
         /// Basic usage:
@@ -271,6 +320,8 @@ macro_rules! int_impl {
         /// Shifts the bits to the right by a specified amount, `n`,
         /// wrapping the truncated bits to the beginning of the resulting
         /// integer.
+        ///
+        /// Please note this isn't the same operation as `>>`!
         ///
         /// # Examples
         ///
@@ -560,6 +611,31 @@ macro_rules! int_impl {
             if b {None} else {Some(a)}
         }
 
+        /// Checked absolute value. Computes `self.abs()`, returning `None` if
+        /// `self == MIN`.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// # #![feature(no_panic_abs)]
+        ///
+        /// use std::i32;
+        ///
+        /// assert_eq!((-5i32).checked_abs(), Some(5));
+        /// assert_eq!(i32::MIN.checked_abs(), None);
+        /// ```
+        #[unstable(feature = "no_panic_abs", issue = "35057")]
+        #[inline]
+        pub fn checked_abs(self) -> Option<Self> {
+            if self.is_negative() {
+                self.checked_neg()
+            } else {
+                Some(self)
+            }
+        }
+
         /// Saturating integer addition. Computes `self + other`, saturating at
         /// the numeric bounds instead of overflowing.
         ///
@@ -576,7 +652,7 @@ macro_rules! int_impl {
         pub fn saturating_add(self, other: Self) -> Self {
             match self.checked_add(other) {
                 Some(x) => x,
-                None if other >= Self::zero() => Self::max_value(),
+                None if other >= 0 => Self::max_value(),
                 None => Self::min_value(),
             }
         }
@@ -597,7 +673,7 @@ macro_rules! int_impl {
         pub fn saturating_sub(self, other: Self) -> Self {
             match self.checked_sub(other) {
                 Some(x) => x,
-                None if other >= Self::zero() => Self::min_value(),
+                None if other >= 0 => Self::min_value(),
                 None => Self::max_value(),
             }
         }
@@ -812,6 +888,36 @@ macro_rules! int_impl {
             self.overflowing_shr(rhs).0
         }
 
+        /// Wrapping (modular) absolute value. Computes `self.abs()`,
+        /// wrapping around at the boundary of the type.
+        ///
+        /// The only case where such wrapping can occur is when one takes
+        /// the absolute value of the negative minimal value for the type
+        /// this is a positive value that is too large to represent in the
+        /// type. In such a case, this function returns `MIN` itself.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// # #![feature(no_panic_abs)]
+        ///
+        /// assert_eq!(100i8.wrapping_abs(), 100);
+        /// assert_eq!((-100i8).wrapping_abs(), 100);
+        /// assert_eq!((-128i8).wrapping_abs(), -128);
+        /// assert_eq!((-128i8).wrapping_abs() as u8, 128);
+        /// ```
+        #[unstable(feature = "no_panic_abs", issue = "35057")]
+        #[inline(always)]
+        pub fn wrapping_abs(self) -> Self {
+            if self.is_negative() {
+                self.wrapping_neg()
+            } else {
+                self
+            }
+        }
+
         /// Calculates `self` + `rhs`
         ///
         /// Returns a tuple of the addition along with a boolean indicating
@@ -1020,6 +1126,35 @@ macro_rules! int_impl {
             (self >> (rhs & ($BITS - 1)), (rhs > ($BITS - 1)))
         }
 
+        /// Computes the absolute value of `self`.
+        ///
+        /// Returns a tuple of the absolute version of self along with a
+        /// boolean indicating whether an overflow happened. If self is the
+        /// minimum value (e.g. i32::MIN for values of type i32), then the
+        /// minimum value will be returned again and true will be returned for
+        /// an overflow happening.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// # #![feature(no_panic_abs)]
+        ///
+        /// assert_eq!(10i8.overflowing_abs(), (10,false));
+        /// assert_eq!((-10i8).overflowing_abs(), (10,false));
+        /// assert_eq!((-128i8).overflowing_abs(), (-128,true));
+        /// ```
+        #[unstable(feature = "no_panic_abs", issue = "35057")]
+        #[inline]
+        pub fn overflowing_abs(self) -> (Self, bool) {
+            if self.is_negative() {
+                self.overflowing_neg()
+            } else {
+                (self, false)
+            }
+        }
+
         /// Raises self to the power of `exp`, using exponentiation by squaring.
         ///
         /// # Examples
@@ -1036,7 +1171,7 @@ macro_rules! int_impl {
         #[rustc_inherit_overflow_checks]
         pub fn pow(self, mut exp: u32) -> Self {
             let mut base = self;
-            let mut acc = Self::one();
+            let mut acc = 1;
 
             while exp > 1 {
                 if (exp & 1) == 1 {
@@ -1214,11 +1349,23 @@ macro_rules! uint_impl {
      $sub_with_overflow:path,
      $mul_with_overflow:path) => {
         /// Returns the smallest value that can be represented by this integer type.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// assert_eq!(u8::min_value(), 0);
+        /// ```
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub const fn min_value() -> Self { 0 }
 
         /// Returns the largest value that can be represented by this integer type.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// assert_eq!(u8::max_value(), 255);
+        /// ```
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub const fn max_value() -> Self { !0 }
@@ -1325,6 +1472,8 @@ macro_rules! uint_impl {
         /// Shifts the bits to the left by a specified amount, `n`,
         /// wrapping the truncated bits to the end of the resulting integer.
         ///
+        /// Please note this isn't the same operation as `<<`!
+        ///
         /// # Examples
         ///
         /// Basic usage:
@@ -1346,6 +1495,8 @@ macro_rules! uint_impl {
         /// Shifts the bits to the right by a specified amount, `n`,
         /// wrapping the truncated bits to the beginning of the resulting
         /// integer.
+        ///
+        /// Please note this isn't the same operation as `>>`!
         ///
         /// # Examples
         ///
@@ -2064,7 +2215,7 @@ macro_rules! uint_impl {
         #[rustc_inherit_overflow_checks]
         pub fn pow(self, mut exp: u32) -> Self {
             let mut base = self;
-            let mut acc = Self::one();
+            let mut acc = 1;
 
             let mut prev_base = self;
             let mut base_oflo = false;
@@ -2101,8 +2252,7 @@ macro_rules! uint_impl {
         #[stable(feature = "rust1", since = "1.0.0")]
         #[inline]
         pub fn is_power_of_two(self) -> bool {
-            (self.wrapping_sub(Self::one())) & self == Self::zero() &&
-                !(self == Self::zero())
+            (self.wrapping_sub(1)) & self == 0 && !(self == 0)
         }
 
         /// Returns the smallest power of two greater than or equal to `self`.
@@ -2120,7 +2270,7 @@ macro_rules! uint_impl {
         #[inline]
         pub fn next_power_of_two(self) -> Self {
             let bits = size_of::<Self>() * 8;
-            let one: Self = Self::one();
+            let one: Self = 1;
             one << ((bits - self.wrapping_sub(one).leading_zeros() as usize) % bits)
         }
 
@@ -2242,26 +2392,45 @@ impl usize {
 ///
 /// [`f32::classify()`]: ../../std/primitive.f32.html#method.classify
 /// [`f64::classify()`]: ../../std/primitive.f64.html#method.classify
+///
+/// # Examples
+///
+/// ```
+/// use std::num::FpCategory;
+/// use std::f32;
+///
+/// let num = 12.4_f32;
+/// let inf = f32::INFINITY;
+/// let zero = 0f32;
+/// let sub: f32 = 1.1754942e-38;
+/// let nan = f32::NAN;
+///
+/// assert_eq!(num.classify(), FpCategory::Normal);
+/// assert_eq!(inf.classify(), FpCategory::Infinite);
+/// assert_eq!(zero.classify(), FpCategory::Zero);
+/// assert_eq!(nan.classify(), FpCategory::Nan);
+/// assert_eq!(sub.classify(), FpCategory::Subnormal);
+/// ```
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub enum FpCategory {
-    /// "Not a Number", often obtained by dividing by zero
+    /// "Not a Number", often obtained by dividing by zero.
     #[stable(feature = "rust1", since = "1.0.0")]
     Nan,
 
-    /// Positive or negative infinity
+    /// Positive or negative infinity.
     #[stable(feature = "rust1", since = "1.0.0")]
     Infinite ,
 
-    /// Positive or negative zero
+    /// Positive or negative zero.
     #[stable(feature = "rust1", since = "1.0.0")]
     Zero,
 
-    /// De-normalized floating point representation (less precise than `Normal`)
+    /// De-normalized floating point representation (less precise than `Normal`).
     #[stable(feature = "rust1", since = "1.0.0")]
     Subnormal,
 
-    /// A regular floating point number
+    /// A regular floating point number.
     #[stable(feature = "rust1", since = "1.0.0")]
     Normal,
 }
@@ -2275,26 +2444,44 @@ pub trait Float: Sized {
     /// Returns the NaN value.
     #[unstable(feature = "float_extras", reason = "needs removal",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn nan() -> Self;
     /// Returns the infinite value.
     #[unstable(feature = "float_extras", reason = "needs removal",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn infinity() -> Self;
     /// Returns the negative infinite value.
     #[unstable(feature = "float_extras", reason = "needs removal",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn neg_infinity() -> Self;
     /// Returns -0.0.
     #[unstable(feature = "float_extras", reason = "needs removal",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn neg_zero() -> Self;
     /// Returns 0.0.
     #[unstable(feature = "float_extras", reason = "needs removal",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn zero() -> Self;
     /// Returns 1.0.
     #[unstable(feature = "float_extras", reason = "needs removal",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn one() -> Self;
 
     /// Returns true if this value is NaN and false otherwise.
@@ -2317,6 +2504,9 @@ pub trait Float: Sized {
     /// Returns the mantissa, exponent and sign as integers, respectively.
     #[unstable(feature = "float_extras", reason = "signature is undecided",
                issue = "27752")]
+    #[rustc_deprecated(since = "1.11.0",
+                       reason = "never really came to fruition and easily \
+                                 implementable outside the standard library")]
     fn integer_decode(self) -> (u64, i16, i8);
 
     /// Computes the absolute value of `self`. Returns `Float::nan()` if the
@@ -2351,12 +2541,10 @@ pub trait Float: Sized {
     fn powi(self, n: i32) -> Self;
 
     /// Convert radians to degrees.
-    #[unstable(feature = "float_extras", reason = "desirability is unclear",
-               issue = "27752")]
+    #[stable(feature = "deg_rad_conversions", since="1.7.0")]
     fn to_degrees(self) -> Self;
     /// Convert degrees to radians.
-    #[unstable(feature = "float_extras", reason = "desirability is unclear",
-               issue = "27752")]
+    #[stable(feature = "deg_rad_conversions", since="1.7.0")]
     fn to_radians(self) -> Self;
 }
 

@@ -175,8 +175,11 @@
 //! }
 //!
 //! fn write_info(info: &Info) -> io::Result<()> {
-//!     let mut file = try!(File::create("my_best_friends.txt"));
 //!     // Early return on error
+//!     let mut file = match File::create("my_best_friends.txt") {
+//!            Err(e) => return Err(e),
+//!            Ok(f) => f,
+//!     };
 //!     if let Err(e) = file.write_all(format!("name: {}\n", info.name).as_bytes()) {
 //!         return Err(e)
 //!     }
@@ -399,8 +402,8 @@ impl<T, E> Result<T, E> {
     /// ```
     /// fn mutate(r: &mut Result<i32, i32>) {
     ///     match r.as_mut() {
-    ///         Ok(&mut ref mut v) => *v = 42,
-    ///         Err(&mut ref mut e) => *e = 0,
+    ///         Ok(v) => *v = 42,
+    ///         Err(e) => *e = 0,
     ///     }
     /// }
     ///

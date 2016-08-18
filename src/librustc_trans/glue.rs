@@ -14,15 +14,12 @@
 
 use std;
 
-use attributes;
-use back::symbol_names;
 use llvm;
 use llvm::{ValueRef, get_param};
 use middle::lang_items::ExchangeFreeFnLangItem;
 use rustc::ty::subst::{Substs};
 use rustc::traits;
 use rustc::ty::{self, Ty, TyCtxt, TypeFoldable};
-use abi::{Abi, FnType};
 use adt;
 use adt::GetDtorType; // for tcx.dtor_type()
 use base::*;
@@ -30,10 +27,8 @@ use build::*;
 use callee::{Callee, ArgVals};
 use cleanup;
 use cleanup::CleanupMethods;
-use collector;
 use common::*;
 use debuginfo::DebugLoc;
-use declare;
 use expr;
 use machine::*;
 use monomorphize;
@@ -43,7 +38,7 @@ use type_::Type;
 use value::Value;
 
 use arena::TypedArena;
-use syntax::codemap::DUMMY_SP;
+use syntax_pos::DUMMY_SP;
 
 pub fn trans_exchange_free_dyn<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                                            v: ValueRef,
@@ -55,7 +50,7 @@ pub fn trans_exchange_free_dyn<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     let def_id = langcall(bcx.tcx(), None, "", ExchangeFreeFnLangItem);
     let args = [PointerCast(bcx, v, Type::i8p(bcx.ccx())), size, align];
-    Callee::def(bcx.ccx(), def_id, bcx.tcx().mk_substs(Substs::empty()))
+    Callee::def(bcx.ccx(), def_id, Substs::empty(bcx.tcx()))
         .call(bcx, debug_loc, ArgVals(&args), None).bcx
 }
 
@@ -120,7 +115,7 @@ pub fn get_drop_glue_type<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     match t.sty {
         ty::TyBox(typ) if !type_needs_drop(tcx, typ)
                          && type_is_sized(tcx, typ) => {
-            tcx.normalizing_infer_ctxt(traits::ProjectionMode::Any).enter(|infcx| {
+            tcx.normalizing_infer_ctxt(traits::Reveal::All).enter(|infcx| {
                 let layout = t.layout(&infcx).unwrap();
                 if layout.size(&tcx.data_layout).bytes() == 0 {
                     // `Box<ZeroSizeType>` does not allocate.
@@ -236,56 +231,49 @@ impl<'tcx> DropGlueKind<'tcx> {
 
 fn get_drop_glue_core<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
                                 g: DropGlueKind<'tcx>) -> ValueRef {
-    debug!("make drop glue for {:?}", g);
     let g = g.map_ty(|t| get_drop_glue_type(ccx.tcx(), t));
-    debug!("drop glue type {:?}", g);
     match ccx.drop_glues().borrow().get(&g) {
-        Some(&glue) => return glue,
-        _ => { }
+        Some(&(glue, _)) => return glue,
+        None => {
+            debug!("Could not find drop glue for {:?} -- {} -- {}. \
+                    Falling back to on-demand instantiation.",
+                    g,
+                    TransItem::DropGlue(g).to_raw_string(),
+                    ccx.codegen_unit().name());
+
+            ccx.stats().n_fallback_instantiations.set(ccx.stats()
+                                                         .n_fallback_instantiations
+                                                         .get() + 1);
+        }
     }
-    let t = g.ty();
 
+    // FIXME: #34151
+    // Normally, getting here would indicate a bug in trans::collector,
+    // since it seems to have missed a translation item. When we are
+    // translating with non-MIR-based trans, however, the results of the
+    // collector are not entirely reliable since it bases its analysis
+    // on MIR. Thus, we'll instantiate the missing function on demand in
+    // this codegen unit, so that things keep working.
+
+    TransItem::DropGlue(g).predefine(ccx, llvm::InternalLinkage);
+    TransItem::DropGlue(g).define(ccx);
+
+    // Now that we made sure that the glue function is in ccx.drop_glues,
+    // give it another try
+    get_drop_glue_core(ccx, g)
+}
+
+pub fn implement_drop_glue<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
+                                     g: DropGlueKind<'tcx>) {
     let tcx = ccx.tcx();
-    let sig = ty::FnSig {
-        inputs: vec![tcx.mk_mut_ptr(tcx.types.i8)],
-        output: ty::FnOutput::FnConverging(tcx.mk_nil()),
-        variadic: false,
-    };
-    // Create a FnType for fn(*mut i8) and substitute the real type in
-    // later - that prevents FnType from splitting fat pointers up.
-    let mut fn_ty = FnType::new(ccx, Abi::Rust, &sig, &[]);
-    fn_ty.args[0].original_ty = type_of(ccx, t).ptr_to();
-    let llfnty = fn_ty.llvm_type(ccx);
-
-    // To avoid infinite recursion, don't `make_drop_glue` until after we've
-    // added the entry to the `drop_glues` cache.
-    if let Some(old_sym) = ccx.available_drop_glues().borrow().get(&g) {
-        let llfn = declare::declare_cfn(ccx, &old_sym, llfnty);
-        ccx.drop_glues().borrow_mut().insert(g, llfn);
-        return llfn;
-    };
-
-    let suffix = match g {
-        DropGlueKind::Ty(_) => "drop",
-        DropGlueKind::TyContents(_) => "drop_contents",
-    };
-
-    let fn_nm = symbol_names::internal_name_from_type_and_suffix(ccx, t, suffix);
-    assert!(declare::get_defined_value(ccx, &fn_nm).is_none());
-    let llfn = declare::declare_cfn(ccx, &fn_nm, llfnty);
-    attributes::set_frame_pointer_elimination(ccx, llfn);
-    ccx.available_drop_glues().borrow_mut().insert(g, fn_nm);
-    ccx.drop_glues().borrow_mut().insert(g, llfn);
-
-    let _s = StatRecorder::new(ccx, format!("drop {:?}", t));
+    assert_eq!(g.ty(), get_drop_glue_type(tcx, g.ty()));
+    let (llfn, fn_ty) = ccx.drop_glues().borrow().get(&g).unwrap().clone();
 
     let (arena, fcx): (TypedArena<_>, FunctionContext);
     arena = TypedArena::new();
     fcx = FunctionContext::new(ccx, llfn, fn_ty, None, &arena);
 
     let bcx = fcx.init(false, None);
-
-    update_linkage(ccx, llfn, None, OriginalTranslation);
 
     ccx.stats().n_glues_created.set(ccx.stats().n_glues_created.get() + 1);
     // All glue functions take values passed *by alias*; this is a
@@ -298,9 +286,8 @@ fn get_drop_glue_core<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
 
     let bcx = make_drop_glue(bcx, get_param(llfn, 0), g);
     fcx.finish(bcx, DebugLoc::None);
-
-    llfn
 }
+
 
 fn trans_struct_drop_flag<'blk, 'tcx>(mut bcx: Block<'blk, 'tcx>,
                                       t: Ty<'tcx>,
@@ -369,7 +356,7 @@ fn trans_struct_drop<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     let trait_ref = ty::Binder(ty::TraitRef {
         def_id: tcx.lang_items.drop_trait().unwrap(),
-        substs: tcx.mk_substs(Substs::empty().with_self_ty(t))
+        substs: Substs::new_trait(tcx, vec![], vec![], t)
     });
     let vtbl = match fulfill_obligation(bcx.ccx().shared(), DUMMY_SP, trait_ref) {
         traits::VtableImpl(data) => data,
@@ -494,11 +481,6 @@ pub fn size_and_align_of_dst<'blk, 'tcx>(bcx: &BlockAndBuilder<'blk, 'tcx>,
 
 fn make_drop_glue<'blk, 'tcx>(bcx: Block<'blk, 'tcx>, v0: ValueRef, g: DropGlueKind<'tcx>)
                               -> Block<'blk, 'tcx> {
-    if collector::collecting_debug_information(bcx.ccx().shared()) {
-        bcx.ccx()
-           .record_translation_item_as_generated(TransItem::DropGlue(g));
-    }
-
     let t = g.ty();
 
     let skip_dtor = match g { DropGlueKind::Ty(_) => false, DropGlueKind::TyContents(_) => true };

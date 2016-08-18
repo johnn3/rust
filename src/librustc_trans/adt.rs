@@ -48,7 +48,7 @@ use std;
 use std::rc::Rc;
 
 use llvm::{ValueRef, True, IntEQ, IntNE};
-use rustc::ty::subst;
+use rustc::ty::subst::Substs;
 use rustc::ty::{self, Ty, TyCtxt};
 use syntax::ast;
 use syntax::attr;
@@ -191,9 +191,8 @@ pub fn represent_type<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                                 t: Ty<'tcx>)
                                 -> Rc<Repr<'tcx>> {
     debug!("Representing: {}", t);
-    match cx.adt_reprs().borrow().get(&t) {
-        Some(repr) => return repr.clone(),
-        None => {}
+    if let Some(repr) = cx.adt_reprs().borrow().get(&t) {
+        return repr.clone();
     }
 
     let repr = Rc::new(represent_type_uncached(cx, t));
@@ -545,7 +544,7 @@ impl<'tcx> Case<'tcx> {
 
 fn get_cases<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                        adt: ty::AdtDef<'tcx>,
-                       substs: &subst::Substs<'tcx>)
+                       substs: &Substs<'tcx>)
                        -> Vec<Case<'tcx>> {
     adt.variants.iter().map(|vi| {
         let field_tys = vi.fields.iter().map(|field| {

@@ -42,8 +42,8 @@ use std::process::Command;
 use std::str;
 use flate;
 use syntax::ast;
-use syntax::codemap::Span;
 use syntax::attr::AttrMetaMethods;
+use syntax_pos::Span;
 
 // RLIB LLVM-BYTECODE OBJECT LAYOUT
 // Version 1
@@ -136,14 +136,17 @@ pub fn build_link_meta<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     return r;
 }
 
-pub fn get_linker(sess: &Session) -> (String, Command) {
+// The third parameter is for an extra path to add to PATH for MSVC
+// cross linkers for host toolchain DLL dependencies
+pub fn get_linker(sess: &Session) -> (String, Command, Option<PathBuf>) {
     if let Some(ref linker) = sess.opts.cg.linker {
-        (linker.clone(), Command::new(linker))
+        (linker.clone(), Command::new(linker), None)
     } else if sess.target.target.options.is_like_msvc {
-        ("link.exe".to_string(), msvc::link_exe_cmd(sess))
+        let (cmd, host) = msvc::link_exe_cmd(sess);
+        ("link.exe".to_string(), cmd, host)
     } else {
         (sess.target.target.options.linker.clone(),
-         Command::new(&sess.target.target.options.linker))
+         Command::new(&sess.target.target.options.linker), None)
     }
 }
 
@@ -153,7 +156,7 @@ pub fn get_ar_prog(sess: &Session) -> String {
     })
 }
 
-fn command_path(sess: &Session) -> OsString {
+fn command_path(sess: &Session, extra: Option<PathBuf>) -> OsString {
     // The compiler's sysroot often has some bundled tools, so add it to the
     // PATH for the child.
     let mut new_path = sess.host_filesearch(PathKind::All)
@@ -161,9 +164,7 @@ fn command_path(sess: &Session) -> OsString {
     if let Some(path) = env::var_os("PATH") {
         new_path.extend(env::split_paths(&path));
     }
-    if sess.target.target.options.is_like_msvc {
-        new_path.extend(msvc::host_dll_path());
-    }
+    new_path.extend(extra);
     env::join_paths(new_path).unwrap()
 }
 
@@ -189,7 +190,8 @@ pub fn link_binary(sess: &Session,
     let mut out_filenames = Vec::new();
     for &crate_type in sess.crate_types.borrow().iter() {
         // Ignore executable crates if we have -Z no-trans, as they will error.
-        if sess.opts.no_trans && crate_type == config::CrateTypeExecutable {
+        if sess.opts.debugging_opts.no_trans &&
+           crate_type == config::CrateTypeExecutable {
             continue;
         }
 
@@ -204,7 +206,7 @@ pub fn link_binary(sess: &Session,
 
     // Remove the temporary object file and metadata if we aren't saving temps
     if !sess.opts.cg.save_temps {
-        for obj in object_filenames(sess, outputs) {
+        for obj in object_filenames(trans, outputs) {
             remove(sess, &obj);
         }
         remove(sess, &outputs.with_extension("metadata.o"));
@@ -315,7 +317,7 @@ fn link_binary_output(sess: &Session,
                       crate_type: config::CrateType,
                       outputs: &OutputFilenames,
                       crate_name: &str) -> PathBuf {
-    let objects = object_filenames(sess, outputs);
+    let objects = object_filenames(trans, outputs);
     let default_filename = filename_for_input(sess, crate_type, crate_name,
                                               outputs);
     let out_filename = outputs.outputs.get(&OutputType::Exe)
@@ -355,10 +357,11 @@ fn link_binary_output(sess: &Session,
     out_filename
 }
 
-fn object_filenames(sess: &Session, outputs: &OutputFilenames) -> Vec<PathBuf> {
-    (0..sess.opts.cg.codegen_units).map(|i| {
-        let ext = format!("{}.o", i);
-        outputs.temp_path(OutputType::Object).with_extension(&ext)
+fn object_filenames(trans: &CrateTranslation,
+                    outputs: &OutputFilenames)
+                    -> Vec<PathBuf> {
+    trans.modules.iter().map(|module| {
+        outputs.temp_path(OutputType::Object, Some(&module.name[..]))
     }).collect()
 }
 
@@ -379,7 +382,7 @@ fn archive_config<'a>(sess: &'a Session,
         src: input.map(|p| p.to_path_buf()),
         lib_search_paths: archive_search_paths(sess),
         ar_prog: get_ar_prog(sess),
-        command_path: command_path(sess),
+        command_path: command_path(sess, None),
     }
 }
 
@@ -411,13 +414,6 @@ fn link_rlib<'a>(sess: &'a Session,
     // After adding all files to the archive, we need to update the
     // symbol table of the archive.
     ab.update_symbols();
-
-    // For OSX/iOS, we must be careful to update symbols only when adding
-    // object files.  We're about to start adding non-object files, so run
-    // `ar` now to process the object files.
-    if sess.target.target.options.is_like_osx && !ab.using_llvm() {
-        ab.build();
-    }
 
     // Note that it is important that we add all of our non-object "magical
     // files" *after* all of the object files in the archive. The reason for
@@ -503,7 +499,7 @@ fn link_rlib<'a>(sess: &'a Session,
                 ab.add_file(&bc_deflated_filename);
 
                 // See the bottom of back::write::run_passes for an explanation
-                // of when we do and don't keep .0.bc files around.
+                // of when we do and don't keep .#module-name#.bc files around.
                 let user_wants_numbered_bitcode =
                         sess.opts.output_types.contains_key(&OutputType::Bitcode) &&
                         sess.opts.cg.codegen_units > 1;
@@ -515,7 +511,7 @@ fn link_rlib<'a>(sess: &'a Session,
             // After adding all files to the archive, we need to update the
             // symbol table of the archive. This currently dies on OSX (see
             // #11162), and isn't necessary there anyway
-            if !sess.target.target.options.is_like_osx || ab.using_llvm() {
+            if !sess.target.target.options.is_like_osx {
                 ab.update_symbols();
             }
         }
@@ -575,9 +571,6 @@ fn write_rlib_bytecode_object_v1(writer: &mut Write,
 fn link_staticlib(sess: &Session, objects: &[PathBuf], out_filename: &Path,
                   tempdir: &Path) {
     let mut ab = link_rlib(sess, None, objects, out_filename, tempdir);
-    if sess.target.target.options.is_like_osx && !ab.using_llvm() {
-        ab.build();
-    }
     if !sess.target.target.options.no_compiler_rt {
         ab.add_native_library("compiler-rt");
     }
@@ -626,8 +619,8 @@ fn link_natively(sess: &Session,
     info!("preparing {:?} from {:?} to {:?}", crate_type, objects, out_filename);
 
     // The invocations of cc share some flags across platforms
-    let (pname, mut cmd) = get_linker(sess);
-    cmd.env("PATH", command_path(sess));
+    let (pname, mut cmd, extra) = get_linker(sess);
+    cmd.env("PATH", command_path(sess, extra));
 
     let root = sess.target_filesearch(PathKind::Native).get_lib_path();
     cmd.args(&sess.target.target.options.pre_link_args);
@@ -692,10 +685,15 @@ fn link_natively(sess: &Session,
             info!("linker stdout:\n{}", escape_string(&prog.stdout[..]));
         },
         Err(e) => {
-            // Trying to diagnose https://github.com/rust-lang/rust/issues/33844
             sess.struct_err(&format!("could not exec the linker `{}`: {}", pname, e))
                 .note(&format!("{:?}", &cmd))
                 .emit();
+            if sess.target.target.options.is_like_msvc && e.kind() == io::ErrorKind::NotFound {
+                sess.note_without_error("the msvc targets depend on the msvc linker \
+                    but `link.exe` was not found");
+                sess.note_without_error("please ensure that VS 2013 or VS 2015 was installed \
+                    with the Visual C++ option");
+            }
             sess.abort_if_errors();
         }
     }
@@ -942,7 +940,7 @@ fn add_upstream_rust_crates(cmd: &mut Linker,
             Linkage::IncludedFromDylib => {}
             Linkage::Static => {
                 add_static_crate(cmd, sess, tmpdir, crate_type,
-                                 &src.rlib.unwrap().0)
+                                 &src.rlib.unwrap().0, sess.cstore.is_no_builtins(cnum))
             }
             Linkage::Dynamic => {
                 add_dynamic_crate(cmd, sess, &src.dylib.unwrap().0)
@@ -966,12 +964,16 @@ fn add_upstream_rust_crates(cmd: &mut Linker,
     // * For LTO, we remove upstream object files.
     // * For dylibs we remove metadata and bytecode from upstream rlibs
     //
-    // When performing LTO, all of the bytecode from the upstream libraries has
-    // already been included in our object file output. As a result we need to
-    // remove the object files in the upstream libraries so the linker doesn't
-    // try to include them twice (or whine about duplicate symbols). We must
-    // continue to include the rest of the rlib, however, as it may contain
-    // static native libraries which must be linked in.
+    // When performing LTO, almost(*) all of the bytecode from the upstream
+    // libraries has already been included in our object file output. As a
+    // result we need to remove the object files in the upstream libraries so
+    // the linker doesn't try to include them twice (or whine about duplicate
+    // symbols). We must continue to include the rest of the rlib, however, as
+    // it may contain static native libraries which must be linked in.
+    //
+    // (*) Crates marked with `#![no_builtins]` don't participate in LTO and
+    // their bytecode wasn't included. The object files in those libraries must
+    // still be passed to the linker.
     //
     // When making a dynamic library, linkers by default don't include any
     // object files in an archive if they're not necessary to resolve the link.
@@ -991,7 +993,8 @@ fn add_upstream_rust_crates(cmd: &mut Linker,
                         sess: &Session,
                         tmpdir: &Path,
                         crate_type: config::CrateType,
-                        cratepath: &Path) {
+                        cratepath: &Path,
+                        is_a_no_builtins_crate: bool) {
         if !sess.lto() && crate_type != config::CrateTypeDylib {
             cmd.link_rlib(&fix_windows_verbatim_for_gcc(cratepath));
             return
@@ -1015,7 +1018,8 @@ fn add_upstream_rust_crates(cmd: &mut Linker,
                 }
                 let canonical = f.replace("-", "_");
                 let canonical_name = name.replace("-", "_");
-                if sess.lto() && canonical.starts_with(&canonical_name) &&
+                if sess.lto() && !is_a_no_builtins_crate &&
+                   canonical.starts_with(&canonical_name) &&
                    canonical.ends_with(".o") {
                     let num = &f[name.len()..f.len() - 2];
                     if num.len() > 0 && num[1..].parse::<u32>().is_ok() {

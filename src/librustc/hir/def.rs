@@ -9,7 +9,6 @@
 // except according to those terms.
 
 use hir::def_id::DefId;
-use ty::subst::ParamSpace;
 use util::nodemap::NodeMap;
 use syntax::ast;
 use hir;
@@ -31,7 +30,7 @@ pub enum Def {
     AssociatedTy(DefId /* trait */, DefId),
     Trait(DefId),
     PrimTy(hir::PrimTy),
-    TyParam(ParamSpace, u32, DefId, ast::Name),
+    TyParam(DefId),
     Upvar(DefId,        // def id of closed over local
              ast::NodeId,  // node id of closed over local
              usize,        // index in the freevars list of the closure
@@ -67,6 +66,10 @@ pub struct PathResolution {
 }
 
 impl PathResolution {
+    pub fn new(def: Def) -> PathResolution {
+        PathResolution { base_def: def, depth: 0 }
+    }
+
     /// Get the definition, if fully resolved, otherwise panic.
     pub fn full_def(&self) -> Def {
         if self.depth != 0 {
@@ -75,17 +78,11 @@ impl PathResolution {
         self.base_def
     }
 
-    /// Get the DefId, if fully resolved, otherwise panic.
-    pub fn def_id(&self) -> DefId {
-        self.full_def().def_id()
-    }
-
-    pub fn new(base_def: Def,
-               depth: usize)
-               -> PathResolution {
-        PathResolution {
-            base_def: base_def,
-            depth: depth,
+    pub fn kind_name(&self) -> &'static str {
+        if self.depth != 0 {
+            "associated item"
+        } else {
+            self.base_def.kind_name()
         }
     }
 }
@@ -124,7 +121,7 @@ impl Def {
         match *self {
             Def::Fn(id) | Def::Mod(id) | Def::ForeignMod(id) | Def::Static(id, _) |
             Def::Variant(_, id) | Def::Enum(id) | Def::TyAlias(id) | Def::AssociatedTy(_, id) |
-            Def::TyParam(_, _, id, _) | Def::Struct(id) | Def::Trait(id) |
+            Def::TyParam(id) | Def::Struct(id) | Def::Trait(id) |
             Def::Method(id) | Def::Const(id) | Def::AssociatedConst(id) |
             Def::Local(id, _) | Def::Upvar(id, _, _, _) => {
                 id
@@ -136,15 +133,6 @@ impl Def {
             Def::Err => {
                 bug!("attempted .def_id() on invalid def: {:?}", self)
             }
-        }
-    }
-
-    pub fn variant_def_ids(&self) -> Option<(DefId, DefId)> {
-        match *self {
-            Def::Variant(enum_id, var_id) => {
-                Some((enum_id, var_id))
-            }
-            _ => None
         }
     }
 
@@ -161,8 +149,8 @@ impl Def {
             Def::Struct(..) => "struct",
             Def::Trait(..) => "trait",
             Def::Method(..) => "method",
-            Def::Const(..) => "const",
-            Def::AssociatedConst(..) => "associated const",
+            Def::Const(..) => "constant",
+            Def::AssociatedConst(..) => "associated constant",
             Def::TyParam(..) => "type parameter",
             Def::PrimTy(..) => "builtin type",
             Def::Local(..) => "local variable",

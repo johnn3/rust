@@ -14,7 +14,7 @@ use std::rc::Rc;
 use super::{OverlapError, specializes};
 
 use hir::def_id::DefId;
-use traits::{self, ProjectionMode};
+use traits::{self, Reveal};
 use ty::{self, TyCtxt, ImplOrTraitItem, TraitDef, TypeFoldable};
 use ty::fast_reject::{self, SimplifiedType};
 use syntax::ast::Name;
@@ -111,8 +111,7 @@ impl<'a, 'gcx, 'tcx> Children {
             let possible_sibling = *slot;
 
             let tcx = tcx.global_tcx();
-            let (le, ge) = tcx.infer_ctxt(None, None,
-                                          ProjectionMode::Topmost).enter(|infcx| {
+            let (le, ge) = tcx.infer_ctxt(None, None, Reveal::ExactMatch).enter(|infcx| {
                 let overlap = traits::overlapping_impls(&infcx,
                                                         possible_sibling,
                                                         impl_def_id);
@@ -123,19 +122,18 @@ impl<'a, 'gcx, 'tcx> Children {
                     if le == ge {
                         // overlap, but no specialization; error out
                         let trait_ref = impl_header.trait_ref.unwrap();
+                        let self_ty = trait_ref.self_ty();
                         Err(OverlapError {
                             with_impl: possible_sibling,
                             trait_desc: trait_ref.to_string(),
-                            self_desc: trait_ref.substs.self_ty().and_then(|ty| {
-                                // only report the Self type if it has at least
-                                // some outer concrete shell; otherwise, it's
-                                // not adding much information.
-                                if ty.has_concrete_skeleton() {
-                                    Some(ty.to_string())
-                                } else {
-                                    None
-                                }
-                            })
+                            // only report the Self type if it has at least
+                            // some outer concrete shell; otherwise, it's
+                            // not adding much information.
+                            self_desc: if self_ty.has_concrete_skeleton() {
+                                Some(self_ty.to_string())
+                            } else {
+                                None
+                            }
                         })
                     } else {
                         Ok((le, ge))

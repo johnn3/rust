@@ -22,6 +22,7 @@ use rustc::traits;
 use rustc::ty::{self, Ty, TyCtxt, TypeFoldable};
 use rustc::ty::cast::{CastTy, IntTy};
 use rustc::ty::subst::Substs;
+use rustc_data_structures::indexed_vec::{Idx, IndexVec};
 use {abi, adt, base, Disr};
 use callee::Callee;
 use common::{self, BlockAndBuilder, CrateContext, const_get_elt, val_ty};
@@ -33,7 +34,7 @@ use type_of;
 use type_::Type;
 use value::Value;
 
-use syntax::codemap::{Span, DUMMY_SP};
+use syntax_pos::{Span, DUMMY_SP};
 
 use std::ptr;
 
@@ -202,17 +203,8 @@ struct MirConstContext<'a, 'tcx: 'a> {
     /// Type parameters for const fn and associated constants.
     substs: &'tcx Substs<'tcx>,
 
-    /// Arguments passed to a const fn.
-    args: Vec<Const<'tcx>>,
-
-    /// Variable values - specifically, argument bindings of a const fn.
-    vars: Vec<Option<Const<'tcx>>>,
-
-    /// Temp values.
-    temps: Vec<Option<Const<'tcx>>>,
-
-    /// Value assigned to Return, which is the resulting constant.
-    return_value: Option<Const<'tcx>>
+    /// Values of locals in a constant or const fn.
+    locals: IndexVec<mir::Local, Option<Const<'tcx>>>
 }
 
 
@@ -220,30 +212,29 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
     fn new(ccx: &'a CrateContext<'a, 'tcx>,
            mir: &'a mir::Mir<'tcx>,
            substs: &'tcx Substs<'tcx>,
-           args: Vec<Const<'tcx>>)
+           args: IndexVec<mir::Arg, Const<'tcx>>)
            -> MirConstContext<'a, 'tcx> {
-        MirConstContext {
+        let mut context = MirConstContext {
             ccx: ccx,
             mir: mir,
             substs: substs,
-            args: args,
-            vars: vec![None; mir.var_decls.len()],
-            temps: vec![None; mir.temp_decls.len()],
-            return_value: None
+            locals: (0..mir.count_locals()).map(|_| None).collect(),
+        };
+        for (i, arg) in args.into_iter().enumerate() {
+            let index = mir.local_index(&mir::Lvalue::Arg(mir::Arg::new(i))).unwrap();
+            context.locals[index] = Some(arg);
         }
+        context
     }
 
     fn trans_def(ccx: &'a CrateContext<'a, 'tcx>,
                  mut instance: Instance<'tcx>,
-                 args: Vec<Const<'tcx>>)
+                 args: IndexVec<mir::Arg, Const<'tcx>>)
                  -> Result<Const<'tcx>, ConstEvalFailure> {
         // Try to resolve associated constants.
-        if instance.substs.self_ty().is_some() {
-            // Only trait items can have a Self parameter.
-            let trait_item = ccx.tcx().impl_or_trait_item(instance.def);
-            let trait_id = trait_item.container().id();
-            let substs = instance.substs;
-            let trait_ref = ty::Binder(substs.to_trait_ref(ccx.tcx(), trait_id));
+        if let Some(trait_id) = ccx.tcx().trait_of_item(instance.def) {
+            let trait_ref = ty::TraitRef::new(trait_id, instance.substs);
+            let trait_ref = ty::Binder(trait_ref);
             let vtable = common::fulfill_obligation(ccx.shared(), DUMMY_SP, trait_ref);
             if let traits::VtableImpl(vtable_impl) = vtable {
                 let name = ccx.tcx().item_name(instance.def);
@@ -279,30 +270,37 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
         let mut failure = Ok(());
 
         loop {
-            let data = self.mir.basic_block_data(bb);
+            let data = &self.mir[bb];
             for statement in &data.statements {
+                let span = statement.source_info.span;
                 match statement.kind {
                     mir::StatementKind::Assign(ref dest, ref rvalue) => {
-                        let ty = self.mir.lvalue_ty(tcx, dest);
+                        let ty = dest.ty(self.mir, tcx);
                         let ty = self.monomorphize(&ty).to_ty(tcx);
-                        match self.const_rvalue(rvalue, ty, statement.span) {
-                            Ok(value) => self.store(dest, value, statement.span),
+                        match self.const_rvalue(rvalue, ty, span) {
+                            Ok(value) => self.store(dest, value, span),
                             Err(err) => if failure.is_ok() { failure = Err(err); }
                         }
+                    }
+                    mir::StatementKind::StorageLive(_) |
+                    mir::StatementKind::StorageDead(_) => {}
+                    mir::StatementKind::SetDiscriminant{ .. } => {
+                        span_bug!(span, "SetDiscriminant should not appear in constants?");
                     }
                 }
             }
 
             let terminator = data.terminator();
-            let span = terminator.span;
+            let span = terminator.source_info.span;
             bb = match terminator.kind {
                 mir::TerminatorKind::Drop { target, .. } | // No dropping.
                 mir::TerminatorKind::Goto { target } => target,
                 mir::TerminatorKind::Return => {
                     failure?;
-                    return Ok(self.return_value.unwrap_or_else(|| {
+                    let index = self.mir.local_index(&mir::Lvalue::ReturnPointer).unwrap();
+                    return Ok(self.locals[index].unwrap_or_else(|| {
                         span_bug!(span, "no returned value in constant");
-                    }))
+                    }));
                 }
 
                 mir::TerminatorKind::Assert { ref cond, expected, ref msg, target, .. } => {
@@ -331,7 +329,7 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
                 }
 
                 mir::TerminatorKind::Call { ref func, ref args, ref destination, .. } => {
-                    let fn_ty = self.mir.operand_ty(tcx, func);
+                    let fn_ty = func.ty(self.mir, tcx);
                     let fn_ty = self.monomorphize(&fn_ty);
                     let instance = match fn_ty.sty {
                         ty::TyFnDef(def_id, substs, _) => {
@@ -341,10 +339,10 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
                                        func, fn_ty)
                     };
 
-                    let mut const_args = Vec::with_capacity(args.len());
+                    let mut const_args = IndexVec::with_capacity(args.len());
                     for arg in args {
                         match self.const_operand(arg, span) {
-                            Ok(arg) => const_args.push(arg),
+                            Ok(arg) => { const_args.push(arg); },
                             Err(err) => if failure.is_ok() { failure = Err(err); }
                         }
                     }
@@ -364,39 +362,34 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
     }
 
     fn store(&mut self, dest: &mir::Lvalue<'tcx>, value: Const<'tcx>, span: Span) {
-        let dest = match *dest {
-            mir::Lvalue::Var(index) => &mut self.vars[index as usize],
-            mir::Lvalue::Temp(index) => &mut self.temps[index as usize],
-            mir::Lvalue::ReturnPointer => &mut self.return_value,
-            _ => span_bug!(span, "assignment to {:?} in constant", dest)
-        };
-        *dest = Some(value);
+        if let Some(index) = self.mir.local_index(dest) {
+            self.locals[index] = Some(value);
+        } else {
+            span_bug!(span, "assignment to {:?} in constant", dest);
+        }
     }
 
     fn const_lvalue(&self, lvalue: &mir::Lvalue<'tcx>, span: Span)
                     -> Result<ConstLvalue<'tcx>, ConstEvalFailure> {
         let tcx = self.ccx.tcx();
+
+        if let Some(index) = self.mir.local_index(lvalue) {
+            return Ok(self.locals[index].unwrap_or_else(|| {
+                span_bug!(span, "{:?} not initialized", lvalue)
+            }).as_lvalue());
+        }
+
         let lvalue = match *lvalue {
-            mir::Lvalue::Var(index) => {
-                self.vars[index as usize].unwrap_or_else(|| {
-                    span_bug!(span, "var{} not initialized", index)
-                }).as_lvalue()
-            }
-            mir::Lvalue::Temp(index) => {
-                self.temps[index as usize].unwrap_or_else(|| {
-                    span_bug!(span, "tmp{} not initialized", index)
-                }).as_lvalue()
-            }
-            mir::Lvalue::Arg(index) => self.args[index as usize].as_lvalue(),
+            mir::Lvalue::Var(_) |
+            mir::Lvalue::Temp(_) |
+            mir::Lvalue::Arg(_) |
+            mir::Lvalue::ReturnPointer => bug!(), // handled above
             mir::Lvalue::Static(def_id) => {
                 ConstLvalue {
                     base: Base::Static(consts::get_static(self.ccx, def_id).val),
                     llextra: ptr::null_mut(),
-                    ty: self.mir.lvalue_ty(tcx, lvalue).to_ty(tcx)
+                    ty: lvalue.ty(self.mir, tcx).to_ty(tcx)
                 }
-            }
-            mir::Lvalue::ReturnPointer => {
-                span_bug!(span, "accessing Lvalue::ReturnPointer in constant")
             }
             mir::Lvalue::Projection(ref projection) => {
                 let tr_base = self.const_lvalue(&projection.base, span)?;
@@ -488,11 +481,11 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
 
                         let substs = self.monomorphize(&substs);
                         let instance = Instance::new(def_id, substs);
-                        MirConstContext::trans_def(self.ccx, instance, vec![])
+                        MirConstContext::trans_def(self.ccx, instance, IndexVec::new())
                     }
                     mir::Literal::Promoted { index } => {
                         let mir = &self.mir.promoted[index];
-                        MirConstContext::new(self.ccx, mir, self.substs, vec![]).trans()
+                        MirConstContext::new(self.ccx, mir, self.substs, IndexVec::new()).trans()
                     }
                     mir::Literal::Value { value } => {
                         Ok(Const::from_constval(self.ccx, value, ty))
@@ -539,26 +532,10 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
 
                 // FIXME Shouldn't need to manually trigger closure instantiations.
                 if let mir::AggregateKind::Closure(def_id, substs) = *kind {
-                    use rustc::hir;
-                    use syntax::ast::DUMMY_NODE_ID;
-                    use syntax::ptr::P;
                     use closure;
-
-                    closure::trans_closure_expr(closure::Dest::Ignore(self.ccx),
-                                                &hir::FnDecl {
-                                                    inputs: P::new(),
-                                                    output: hir::NoReturn(DUMMY_SP),
-                                                    variadic: false
-                                                },
-                                                &hir::Block {
-                                                    stmts: P::new(),
-                                                    expr: None,
-                                                    id: DUMMY_NODE_ID,
-                                                    rules: hir::DefaultBlock,
-                                                    span: DUMMY_SP
-                                                },
-                                                DUMMY_NODE_ID, def_id,
-                                                self.monomorphize(&substs));
+                    closure::trans_closure_body_via_mir(self.ccx,
+                                                        def_id,
+                                                        self.monomorphize(&substs));
                 }
 
                 let val = if let mir::AggregateKind::Adt(adt_def, index, _) = *kind {
@@ -748,7 +725,7 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
                 let lhs = self.const_operand(lhs, span)?;
                 let rhs = self.const_operand(rhs, span)?;
                 let ty = lhs.ty;
-                let binop_ty = self.mir.binop_ty(tcx, op, lhs.ty, rhs.ty);
+                let binop_ty = op.ty(tcx, lhs.ty, rhs.ty);
                 let (lhs, rhs) = (lhs.llval, rhs.llval);
                 Const::new(const_scalar_binop(op, lhs, rhs, ty), binop_ty)
             }
@@ -757,7 +734,7 @@ impl<'a, 'tcx> MirConstContext<'a, 'tcx> {
                 let lhs = self.const_operand(lhs, span)?;
                 let rhs = self.const_operand(rhs, span)?;
                 let ty = lhs.ty;
-                let val_ty = self.mir.binop_ty(tcx, op, lhs.ty, rhs.ty);
+                let val_ty = op.ty(tcx, lhs.ty, rhs.ty);
                 let binop_ty = tcx.mk_tup(vec![val_ty, tcx.types.bool]);
                 let (lhs, rhs) = (lhs.llval, rhs.llval);
                 assert!(!ty.is_fp());
@@ -849,11 +826,11 @@ pub fn const_scalar_binop(op: mir::BinOp,
             mir::BinOp::Gt | mir::BinOp::Ge => {
                 if is_float {
                     let cmp = base::bin_op_to_fcmp_predicate(op.to_hir_binop());
-                    llvm::ConstFCmp(cmp, lhs, rhs)
+                    llvm::LLVMConstFCmp(cmp, lhs, rhs)
                 } else {
                     let cmp = base::bin_op_to_icmp_predicate(op.to_hir_binop(),
                                                                 signed);
-                    llvm::ConstICmp(cmp, lhs, rhs)
+                    llvm::LLVMConstICmp(cmp, lhs, rhs)
                 }
             }
         }
@@ -913,11 +890,12 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
                 let substs = bcx.monomorphize(&substs);
                 let instance = Instance::new(def_id, substs);
-                MirConstContext::trans_def(bcx.ccx(), instance, vec![])
+                MirConstContext::trans_def(bcx.ccx(), instance, IndexVec::new())
             }
             mir::Literal::Promoted { index } => {
                 let mir = &self.mir.promoted[index];
-                MirConstContext::new(bcx.ccx(), mir, bcx.fcx().param_substs, vec![]).trans()
+                MirConstContext::new(bcx.ccx(), mir, bcx.fcx().param_substs,
+                                     IndexVec::new()).trans()
             }
             mir::Literal::Value { value } => {
                 Ok(Const::from_constval(bcx.ccx(), value, ty))
@@ -933,7 +911,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
             }
             Err(ConstEvalFailure::Runtime(err)) => {
                 span_bug!(constant.span,
-                          "MIR constant {:?} results in runtime panic: {}",
+                          "MIR constant {:?} results in runtime panic: {:?}",
                           constant, err.description())
             }
         }
@@ -944,5 +922,5 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 pub fn trans_static_initializer(ccx: &CrateContext, def_id: DefId)
                                 -> Result<ValueRef, ConstEvalFailure> {
     let instance = Instance::mono(ccx.shared(), def_id);
-    MirConstContext::trans_def(ccx, instance, vec![]).map(|c| c.llval)
+    MirConstContext::trans_def(ccx, instance, IndexVec::new()).map(|c| c.llval)
 }

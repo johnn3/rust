@@ -39,12 +39,12 @@ use std::rc::Rc;
 use std::path::PathBuf;
 use syntax::ast;
 use syntax::attr;
-use syntax::codemap::Span;
 use syntax::ptr::P;
 use syntax::parse::token::InternedString;
+use syntax_pos::Span;
 use rustc_back::target::Target;
 use hir;
-use hir::intravisit::{IdVisitor, IdVisitingOperation, Visitor};
+use hir::intravisit::Visitor;
 
 pub use self::DefLike::{DlDef, DlField, DlImpl};
 pub use self::NativeLibraryKind::{NativeStatic, NativeFramework, NativeUnknown};
@@ -73,7 +73,7 @@ pub enum LinkagePreference {
 }
 
 enum_from_u32! {
-    #[derive(Copy, Clone, PartialEq)]
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum NativeLibraryKind {
         NativeStatic,    // native static library (.a archive)
         NativeFramework, // OSX-specific
@@ -94,19 +94,19 @@ pub enum DefLike {
 /// that we trans.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum InlinedItem {
-    Item(P<hir::Item>),
+    Item(DefId /* def-id in source crate */, P<hir::Item>),
     TraitItem(DefId /* impl id */, P<hir::TraitItem>),
     ImplItem(DefId /* impl id */, P<hir::ImplItem>),
-    Foreign(P<hir::ForeignItem>),
+    Foreign(DefId /* extern item */, P<hir::ForeignItem>),
 }
 
 /// A borrowed version of `hir::InlinedItem`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum InlinedItemRef<'a> {
-    Item(&'a hir::Item),
+    Item(DefId, &'a hir::Item),
     TraitItem(DefId, &'a hir::TraitItem),
     ImplItem(DefId, &'a hir::ImplItem),
-    Foreign(&'a hir::ForeignItem)
+    Foreign(DefId, &'a hir::ForeignItem)
 }
 
 /// Item definitions in the currently-compiled crate would have the CrateNum
@@ -118,12 +118,6 @@ pub struct ChildItem {
     pub def: DefLike,
     pub name: ast::Name,
     pub vis: ty::Visibility,
-}
-
-pub enum FoundAst<'ast> {
-    Found(&'ast InlinedItem),
-    FoundParent(DefId, &'ast hir::Item),
-    NotFound,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -160,7 +154,7 @@ pub trait CrateStore<'tcx> {
     fn item_variances(&self, def: DefId) -> ty::ItemVariances;
     fn repr_attrs(&self, def: DefId) -> Vec<attr::ReprAttr>;
     fn item_type<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
-                     -> ty::TypeScheme<'tcx>;
+                     -> Ty<'tcx>;
     fn visible_parent_map<'a>(&'a self) -> ::std::cell::RefMut<'a, DefIdMap<DefId>>;
     fn item_name(&self, def: DefId) -> ast::Name;
     fn opt_item_name(&self, def: DefId) -> Option<ast::Name>;
@@ -168,6 +162,8 @@ pub trait CrateStore<'tcx> {
                            -> ty::GenericPredicates<'tcx>;
     fn item_super_predicates<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
                                  -> ty::GenericPredicates<'tcx>;
+    fn item_generics<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
+                         -> &'tcx ty::Generics<'tcx>;
     fn item_attrs(&self, def_id: DefId) -> Vec<ast::Attribute>;
     fn trait_def<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)-> ty::TraitDef<'tcx>;
     fn adt_def<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId) -> ty::AdtDefMaster<'tcx>;
@@ -193,8 +189,7 @@ pub trait CrateStore<'tcx> {
     fn impl_parent(&self, impl_def_id: DefId) -> Option<DefId>;
 
     // trait/impl-item info
-    fn trait_of_item<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId)
-                         -> Option<DefId>;
+    fn trait_of_item(&self, def_id: DefId) -> Option<DefId>;
     fn impl_or_trait_item<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
                               -> Option<ty::ImplOrTraitItem<'tcx>>;
 
@@ -233,6 +228,7 @@ pub trait CrateStore<'tcx> {
     fn plugin_registrar_fn(&self, cnum: ast::CrateNum) -> Option<DefId>;
     fn native_libraries(&self, cnum: ast::CrateNum) -> Vec<(NativeLibraryKind, String)>;
     fn reachable_ids(&self, cnum: ast::CrateNum) -> Vec<DefId>;
+    fn is_no_builtins(&self, cnum: ast::CrateNum) -> bool;
 
     // resolve
     fn def_index_for_def_key(&self,
@@ -250,7 +246,10 @@ pub trait CrateStore<'tcx> {
 
     // misc. metadata
     fn maybe_get_item_ast<'a>(&'tcx self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
-                              -> FoundAst<'tcx>;
+                              -> Option<(&'tcx InlinedItem, ast::NodeId)>;
+    fn local_node_for_inlined_defid(&'tcx self, def_id: DefId) -> Option<ast::NodeId>;
+    fn defid_for_inlined_node(&'tcx self, node_id: ast::NodeId) -> Option<DefId>;
+
     fn maybe_get_item_mir<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
                               -> Option<Mir<'tcx>>;
     fn is_item_mir_available(&self, def: DefId) -> bool;
@@ -286,16 +285,11 @@ impl InlinedItem {
         where V: Visitor<'ast>
     {
         match *self {
-            InlinedItem::Item(ref i) => visitor.visit_item(&i),
-            InlinedItem::Foreign(ref i) => visitor.visit_foreign_item(&i),
+            InlinedItem::Item(_, ref i) => visitor.visit_item(&i),
+            InlinedItem::Foreign(_, ref i) => visitor.visit_foreign_item(&i),
             InlinedItem::TraitItem(_, ref ti) => visitor.visit_trait_item(ti),
             InlinedItem::ImplItem(_, ref ii) => visitor.visit_impl_item(ii),
         }
-    }
-
-    pub fn visit_ids<O: IdVisitingOperation>(&self, operation: &mut O) {
-        let mut id_visitor = IdVisitor::new(operation);
-        self.visit(&mut id_visitor);
     }
 }
 
@@ -341,7 +335,7 @@ impl<'tcx> CrateStore<'tcx> for DummyCrateStore {
     fn item_variances(&self, def: DefId) -> ty::ItemVariances { bug!("item_variances") }
     fn repr_attrs(&self, def: DefId) -> Vec<attr::ReprAttr> { bug!("repr_attrs") }
     fn item_type<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
-                     -> ty::TypeScheme<'tcx> { bug!("item_type") }
+                     -> Ty<'tcx> { bug!("item_type") }
     fn visible_parent_map<'a>(&'a self) -> ::std::cell::RefMut<'a, DefIdMap<DefId>> {
         bug!("visible_parent_map")
     }
@@ -351,6 +345,8 @@ impl<'tcx> CrateStore<'tcx> for DummyCrateStore {
                            -> ty::GenericPredicates<'tcx> { bug!("item_predicates") }
     fn item_super_predicates<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
                                  -> ty::GenericPredicates<'tcx> { bug!("item_super_predicates") }
+    fn item_generics<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
+                         -> &'tcx ty::Generics<'tcx> { bug!("item_generics") }
     fn item_attrs(&self, def_id: DefId) -> Vec<ast::Attribute> { bug!("item_attrs") }
     fn trait_def<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)-> ty::TraitDef<'tcx>
         { bug!("trait_def") }
@@ -386,8 +382,7 @@ impl<'tcx> CrateStore<'tcx> for DummyCrateStore {
     fn impl_parent(&self, def: DefId) -> Option<DefId> { bug!("impl_parent") }
 
     // trait/impl-item info
-    fn trait_of_item<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId)
-                         -> Option<DefId> { bug!("trait_of_item") }
+    fn trait_of_item(&self, def_id: DefId) -> Option<DefId> { bug!("trait_of_item") }
     fn impl_or_trait_item<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
                               -> Option<ty::ImplOrTraitItem<'tcx>> { bug!("impl_or_trait_item") }
 
@@ -436,6 +431,7 @@ impl<'tcx> CrateStore<'tcx> for DummyCrateStore {
     fn native_libraries(&self, cnum: ast::CrateNum) -> Vec<(NativeLibraryKind, String)>
         { bug!("native_libraries") }
     fn reachable_ids(&self, cnum: ast::CrateNum) -> Vec<DefId> { bug!("reachable_ids") }
+    fn is_no_builtins(&self, cnum: ast::CrateNum) -> bool { bug!("is_no_builtins") }
 
     // resolve
     fn def_key(&self, def: DefId) -> hir_map::DefKey { bug!("def_key") }
@@ -452,7 +448,16 @@ impl<'tcx> CrateStore<'tcx> for DummyCrateStore {
 
     // misc. metadata
     fn maybe_get_item_ast<'a>(&'tcx self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
-                              -> FoundAst<'tcx> { bug!("maybe_get_item_ast") }
+                              -> Option<(&'tcx InlinedItem, ast::NodeId)> {
+        bug!("maybe_get_item_ast")
+    }
+    fn local_node_for_inlined_defid(&'tcx self, def_id: DefId) -> Option<ast::NodeId> {
+        bug!("local_node_for_inlined_defid")
+    }
+    fn defid_for_inlined_node(&'tcx self, node_id: ast::NodeId) -> Option<DefId> {
+        bug!("defid_for_inlined_node")
+    }
+
     fn maybe_get_item_mir<'a>(&self, tcx: TyCtxt<'a, 'tcx, 'tcx>, def: DefId)
                               -> Option<Mir<'tcx>> { bug!("maybe_get_item_mir") }
     fn is_item_mir_available(&self, def: DefId) -> bool {
@@ -580,7 +585,7 @@ pub mod tls {
     pub trait DecodingContext<'tcx> {
         fn tcx<'a>(&'a self) -> TyCtxt<'a, 'tcx, 'tcx>;
         fn decode_ty(&self, decoder: &mut OpaqueDecoder) -> ty::Ty<'tcx>;
-        fn decode_substs(&self, decoder: &mut OpaqueDecoder) -> Substs<'tcx>;
+        fn decode_substs(&self, decoder: &mut OpaqueDecoder) -> &'tcx Substs<'tcx>;
         fn translate_def_id(&self, def_id: DefId) -> DefId;
     }
 

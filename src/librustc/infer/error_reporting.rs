@@ -82,8 +82,7 @@ use hir::def::Def;
 use hir::def_id::DefId;
 use infer::{self, TypeOrigin};
 use middle::region;
-use ty::subst;
-use ty::{self, Ty, TyCtxt, TypeFoldable};
+use ty::{self, TyCtxt, TypeFoldable};
 use ty::{Region, ReFree};
 use ty::error::TypeError;
 
@@ -91,10 +90,10 @@ use std::cell::{Cell, RefCell};
 use std::char::from_u32;
 use std::fmt;
 use syntax::ast;
-use syntax::errors::{DiagnosticBuilder, check_old_skool};
-use syntax::codemap::{self, Pos, Span};
 use syntax::parse::token;
 use syntax::ptr::P;
+use syntax_pos::{self, Pos, Span};
+use errors::DiagnosticBuilder;
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn note_and_explain_region(self,
@@ -462,52 +461,6 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn report_type_error(&self,
-                         trace: TypeTrace<'tcx>,
-                         terr: &TypeError<'tcx>)
-                         -> DiagnosticBuilder<'tcx> {
-        let (expected, found) = match self.values_str(&trace.values) {
-            Some(v) => v,
-            None => {
-                return self.tcx.sess.diagnostic().struct_dummy(); /* derived error */
-            }
-        };
-
-        let is_simple_error = if let &TypeError::Sorts(ref values) = terr {
-            values.expected.is_primitive() && values.found.is_primitive()
-        } else {
-            false
-        };
-
-        let mut err = struct_span_err!(self.tcx.sess,
-                                       trace.origin.span(),
-                                       E0308,
-                                       "{}",
-                                       trace.origin);
-
-        if !is_simple_error || check_old_skool() {
-            err.note_expected_found(&"type", &expected, &found);
-        }
-
-        err.span_label(trace.origin.span(), &terr);
-
-        self.check_and_note_conflicting_crates(&mut err, terr, trace.origin.span());
-
-        match trace.origin {
-            TypeOrigin::MatchExpressionArm(_, arm_span, source) => match source {
-                hir::MatchSource::IfLetDesugar{..} => {
-                    err.span_note(arm_span, "`if let` arm with an incompatible type");
-                }
-                _ => {
-                    err.span_note(arm_span, "match arm with an incompatible type");
-                }
-            },
-            _ => ()
-        }
-
-        err
-    }
-
     /// Adds a note if the types come from similarly named crates
     fn check_and_note_conflicting_crates(&self,
                                          err: &mut DiagnosticBuilder,
@@ -550,42 +503,100 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
+    fn note_error_origin(&self,
+                         err: &mut DiagnosticBuilder<'tcx>,
+                         origin: &TypeOrigin)
+    {
+        match origin {
+            &TypeOrigin::MatchExpressionArm(_, arm_span, source) => match source {
+                hir::MatchSource::IfLetDesugar {..} => {
+                    err.span_note(arm_span, "`if let` arm with an incompatible type");
+                }
+                _ => {
+                    err.span_note(arm_span, "match arm with an incompatible type");
+                }
+            },
+            _ => ()
+        }
+    }
+
+    pub fn note_type_err(&self,
+                         diag: &mut DiagnosticBuilder<'tcx>,
+                         origin: TypeOrigin,
+                         secondary_span: Option<(Span, String)>,
+                         values: Option<ValuePairs<'tcx>>,
+                         terr: &TypeError<'tcx>)
+    {
+        let expected_found = match values {
+            None => None,
+            Some(values) => match self.values_str(&values) {
+                Some((expected, found)) => Some((expected, found)),
+                None => {
+                    // Derived error. Cancel the emitter.
+                    self.tcx.sess.diagnostic().cancel(diag);
+                    return
+                }
+            }
+        };
+
+        let span = origin.span();
+
+        if let Some((expected, found)) = expected_found {
+            let is_simple_error = if let &TypeError::Sorts(ref values) = terr {
+                values.expected.is_primitive() && values.found.is_primitive()
+            } else {
+                false
+            };
+
+            if !is_simple_error {
+                diag.note_expected_found(&"type", &expected, &found);
+            }
+        }
+
+        diag.span_label(span, &terr);
+        if let Some((sp, msg)) = secondary_span {
+            diag.span_label(sp, &msg);
+        }
+
+        self.note_error_origin(diag, &origin);
+        self.check_and_note_conflicting_crates(diag, terr, span);
+        self.tcx.note_and_explain_type_err(diag, terr, span);
+    }
+
     pub fn report_and_explain_type_error(&self,
                                          trace: TypeTrace<'tcx>,
                                          terr: &TypeError<'tcx>)
-                                         -> DiagnosticBuilder<'tcx> {
-        let span = trace.origin.span();
-        let mut err = self.report_type_error(trace, terr);
-        self.tcx.note_and_explain_type_err(&mut err, terr, span);
-        err
+                                         -> DiagnosticBuilder<'tcx>
+    {
+        // FIXME: do we want to use a different error code for each origin?
+        let mut diag = struct_span_err!(
+            self.tcx.sess, trace.origin.span(), E0308,
+            "{}", trace.origin.as_failure_str()
+        );
+        self.note_type_err(&mut diag, trace.origin, None, Some(trace.values), terr);
+        diag
     }
 
-    /// Returns a string of the form "expected `{}`, found `{}`", or None if this is a derived
-    /// error.
+    /// Returns a string of the form "expected `{}`, found `{}`".
     fn values_str(&self, values: &ValuePairs<'tcx>) -> Option<(String, String)> {
         match *values {
             infer::Types(ref exp_found) => self.expected_found_str(exp_found),
             infer::TraitRefs(ref exp_found) => self.expected_found_str(exp_found),
-            infer::PolyTraitRefs(ref exp_found) => self.expected_found_str(exp_found)
+            infer::PolyTraitRefs(ref exp_found) => self.expected_found_str(exp_found),
         }
     }
 
-    fn expected_found_str<T: fmt::Display + Resolvable<'tcx> + TypeFoldable<'tcx>>(
+    fn expected_found_str<T: fmt::Display + TypeFoldable<'tcx>>(
         &self,
         exp_found: &ty::error::ExpectedFound<T>)
         -> Option<(String, String)>
     {
-        let expected = exp_found.expected.resolve(self);
-        if expected.references_error() {
+        let exp_found = self.resolve_type_vars_if_possible(exp_found);
+        if exp_found.references_error() {
             return None;
         }
 
-        let found = exp_found.found.resolve(self);
-        if found.references_error() {
-            return None;
-        }
-
-        Some((format!("{}", expected), format!("{}", found)))
+        Some((format!("{}", exp_found.expected), format!("{}", exp_found.found)))
     }
 
     fn report_generic_bound_failure(&self,
@@ -1318,7 +1329,6 @@ impl<'a, 'gcx, 'tcx> Rebuilder<'a, 'gcx, 'tcx> {
                 self.rebuild_arg_ty_or_output(&ret_ty, lifetime, anon_nums, region_names)
             ),
             hir::DefaultReturn(span) => hir::DefaultReturn(span),
-            hir::NoReturn(span) => hir::NoReturn(span)
         }
     }
 
@@ -1357,22 +1367,12 @@ impl<'a, 'gcx, 'tcx> Rebuilder<'a, 'gcx, 'tcx> {
                     ty_queue.push(&mut_ty.ty);
                 }
                 hir::TyPath(ref maybe_qself, ref path) => {
-                    let a_def = match self.tcx.def_map.borrow().get(&cur_ty.id) {
-                        None => {
-                            self.tcx
-                                .sess
-                                .fatal(&format!(
-                                        "unbound path {}",
-                                        pprust::path_to_string(path)))
-                        }
-                        Some(d) => d.full_def()
-                    };
-                    match a_def {
+                    match self.tcx.expect_def(cur_ty.id) {
                         Def::Enum(did) | Def::TyAlias(did) | Def::Struct(did) => {
-                            let generics = self.tcx.lookup_item_type(did).generics;
+                            let generics = self.tcx.lookup_generics(did);
 
                             let expected =
-                                generics.regions.len(subst::TypeSpace) as u32;
+                                generics.regions.len() as u32;
                             let lifetimes =
                                 path.segments.last().unwrap().parameters.lifetimes();
                             let mut insert = Vec::new();
@@ -1618,59 +1618,21 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     fn note_region_origin(&self, err: &mut DiagnosticBuilder, origin: &SubregionOrigin<'tcx>) {
         match *origin {
             infer::Subtype(ref trace) => {
-                let desc = match trace.origin {
-                    TypeOrigin::Misc(_) => {
-                        "types are compatible"
-                    }
-                    TypeOrigin::MethodCompatCheck(_) => {
-                        "method type is compatible with trait"
-                    }
-                    TypeOrigin::ExprAssignable(_) => {
-                        "expression is assignable"
-                    }
-                    TypeOrigin::RelateTraitRefs(_) => {
-                        "traits are compatible"
-                    }
-                    TypeOrigin::RelateSelfType(_) => {
-                        "self type matches impl self type"
-                    }
-                    TypeOrigin::RelateOutputImplTypes(_) => {
-                        "trait type parameters matches those \
-                                 specified on the impl"
-                    }
-                    TypeOrigin::MatchExpressionArm(_, _, _) => {
-                        "match arms have compatible types"
-                    }
-                    TypeOrigin::IfExpression(_) => {
-                        "if and else have compatible types"
-                    }
-                    TypeOrigin::IfExpressionWithNoElse(_) => {
-                        "if may be missing an else clause"
-                    }
-                    TypeOrigin::RangeExpression(_) => {
-                        "start and end of range have compatible types"
-                    }
-                    TypeOrigin::EquatePredicate(_) => {
-                        "equality where clause is satisfied"
-                    }
-                };
+                if let Some((expected, found)) = self.values_str(&trace.values) {
+                    // FIXME: do we want a "the" here?
+                    err.span_note(
+                        trace.origin.span(),
+                        &format!("...so that {} (expected {}, found {})",
+                                 trace.origin.as_requirement_str(), expected, found));
+                } else {
+                    // FIXME: this really should be handled at some earlier stage. Our
+                    // handling of region checking when type errors are present is
+                    // *terrible*.
 
-                match self.values_str(&trace.values) {
-                    Some((expected, found)) => {
-                        err.span_note(
-                            trace.origin.span(),
-                            &format!("...so that {} (expected {}, found {})",
-                                    desc, expected, found));
-                    }
-                    None => {
-                        // Really should avoid printing this error at
-                        // all, since it is derived, but that would
-                        // require more refactoring than I feel like
-                        // doing right now. - nmatsakis
-                        err.span_note(
-                            trace.origin.span(),
-                            &format!("...so that {}", desc));
-                    }
+                    err.span_note(
+                        trace.origin.span(),
+                        &format!("...so that {}",
+                                 trace.origin.as_requirement_str()));
                 }
             }
             infer::Reborrow(span) => {
@@ -1813,32 +1775,6 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     }
 }
 
-pub trait Resolvable<'tcx> {
-    fn resolve<'a, 'gcx>(&self, infcx: &InferCtxt<'a, 'gcx, 'tcx>) -> Self;
-}
-
-impl<'tcx> Resolvable<'tcx> for Ty<'tcx> {
-    fn resolve<'a, 'gcx>(&self, infcx: &InferCtxt<'a, 'gcx, 'tcx>) -> Ty<'tcx> {
-        infcx.resolve_type_vars_if_possible(self)
-    }
-}
-
-impl<'tcx> Resolvable<'tcx> for ty::TraitRef<'tcx> {
-    fn resolve<'a, 'gcx>(&self, infcx: &InferCtxt<'a, 'gcx, 'tcx>)
-                         -> ty::TraitRef<'tcx> {
-        infcx.resolve_type_vars_if_possible(self)
-    }
-}
-
-impl<'tcx> Resolvable<'tcx> for ty::PolyTraitRef<'tcx> {
-    fn resolve<'a, 'gcx>(&self,
-                         infcx: &InferCtxt<'a, 'gcx, 'tcx>)
-                         -> ty::PolyTraitRef<'tcx>
-    {
-        infcx.resolve_type_vars_if_possible(self)
-    }
-}
-
 fn lifetimes_in_scope<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
                                       scope_id: ast::NodeId)
                                       -> Vec<hir::LifetimeDef> {
@@ -1866,11 +1802,10 @@ fn lifetimes_in_scope<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
         },
         None => None
     };
-    if method_id_opt.is_some() {
-        let method_id = method_id_opt.unwrap();
+    if let Some(method_id) = method_id_opt {
         let parent = tcx.map.get_parent(method_id);
-        match tcx.map.find(parent) {
-            Some(node) => match node {
+        if let Some(node) = tcx.map.find(parent) {
+            match node {
                 ast_map::NodeItem(item) => match item.node {
                     hir::ItemImpl(_, _, ref gen, _, _, _) => {
                         taken.extend_from_slice(&gen.lifetimes);
@@ -1878,8 +1813,7 @@ fn lifetimes_in_scope<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
                     _ => ()
                 },
                 _ => ()
-            },
-            None => ()
+            }
         }
     }
     return taken;
@@ -1945,7 +1879,6 @@ impl LifeGiver {
 
 fn name_to_dummy_lifetime(name: ast::Name) -> hir::Lifetime {
     hir::Lifetime { id: ast::DUMMY_NODE_ID,
-                    span: codemap::DUMMY_SP,
+                    span: syntax_pos::DUMMY_SP,
                     name: name }
 }
-

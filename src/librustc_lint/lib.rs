@@ -45,6 +45,7 @@ extern crate rustc;
 extern crate log;
 extern crate rustc_back;
 extern crate rustc_const_eval;
+extern crate syntax_pos;
 
 pub use rustc::lint as lint;
 pub use rustc::middle as middle;
@@ -107,6 +108,7 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                  HardwiredLints,
                  WhileTrue,
                  ImproperCTypes,
+                 VariantSizeDifferences,
                  BoxPointers,
                  UnusedAttributes,
                  PathStatements,
@@ -122,7 +124,6 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                  UnusedAllocation,
                  MissingCopyImplementations,
                  UnstableFeatures,
-                 Deprecated,
                  UnconditionalRecursion,
                  InvalidNoMangleItems,
                  PluginAsLibrary,
@@ -131,6 +132,7 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                  );
 
     add_builtin_with_new!(sess,
+                          Deprecated,
                           TypeLimits,
                           MissingDoc,
                           MissingDebugImplementations,
@@ -155,7 +157,7 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
     store.register_future_incompatible(sess, vec![
         FutureIncompatibleInfo {
             id: LintId::of(PRIVATE_IN_PUBLIC),
-            reference: "the explanation for E0446 (`--explain E0446`)",
+            reference: "issue #34537 <https://github.com/rust-lang/rust/issues/34537>",
         },
         FutureIncompatibleInfo {
             id: LintId::of(INACCESSIBLE_EXTERN_CRATE),
@@ -163,7 +165,7 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
         },
         FutureIncompatibleInfo {
             id: LintId::of(INVALID_TYPE_PARAM_DEFAULT),
-            reference: "PR 30742 <https://github.com/rust-lang/rust/pull/30724>",
+            reference: "PR 30724 <https://github.com/rust-lang/rust/pull/30724>",
         },
         FutureIncompatibleInfo {
             id: LintId::of(SUPER_OR_SELF_IN_GLOBAL_PATH),
@@ -207,9 +209,6 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
             reference: "RFC 1177 <https://github.com/rust-lang/rfcs/pull/1177>",
         },
         ]);
-
-    // We have one lint pass defined specially
-    store.register_late_pass(sess, false, box lint::GatherNodeLevels);
 
     // Register renamed and removed lints
     store.register_renamed("unknown_features", "unused_features");

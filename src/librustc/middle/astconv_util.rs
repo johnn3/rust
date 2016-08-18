@@ -17,20 +17,25 @@
 use hir::def::Def;
 use ty::{Ty, TyCtxt};
 
-use syntax::codemap::Span;
+use syntax_pos::Span;
 use hir as ast;
 
 impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn prohibit_type_params(self, segments: &[ast::PathSegment]) {
         for segment in segments {
             for typ in segment.parameters.types() {
-                span_err!(self.sess, typ.span, E0109,
-                          "type parameters are not allowed on this type");
+                struct_span_err!(self.sess, typ.span, E0109,
+                                 "type parameters are not allowed on this type")
+                    .span_label(typ.span, &format!("type parameter not allowed"))
+                    .emit();
                 break;
             }
             for lifetime in segment.parameters.lifetimes() {
-                span_err!(self.sess, lifetime.span, E0110,
-                          "lifetime parameters are not allowed on this type");
+                struct_span_err!(self.sess, lifetime.span, E0110,
+                                 "lifetime parameters are not allowed on this type")
+                    .span_label(lifetime.span,
+                                &format!("lifetime parameter not allowed on this type"))
+                    .emit();
                 break;
             }
             for binding in segment.parameters.bindings() {
@@ -42,8 +47,9 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 
     pub fn prohibit_projection(self, span: Span)
     {
-        span_err!(self.sess, span, E0229,
-                  "associated type bindings are not allowed here");
+        let mut err = struct_span_err!(self.sess, span, E0229,
+                                       "associated type bindings are not allowed here");
+        err.span_label(span, &format!("associate type not allowed here")).emit();
     }
 
     pub fn prim_ty_to_ty(self,
@@ -65,13 +71,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// to it.
     pub fn ast_ty_to_prim_ty(self, ast_ty: &ast::Ty) -> Option<Ty<'tcx>> {
         if let ast::TyPath(None, ref path) = ast_ty.node {
-            let def = match self.def_map.borrow().get(&ast_ty.id) {
-                None => {
-                    span_bug!(ast_ty.span, "unbound path {:?}", path)
-                }
-                Some(d) => d.full_def()
-            };
-            if let Def::PrimTy(nty) = def {
+            if let Def::PrimTy(nty) = self.expect_def(ast_ty.id) {
                 Some(self.prim_ty_to_ty(&path.segments, nty))
             } else {
                 None

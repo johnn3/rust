@@ -20,10 +20,11 @@
 
 use ast::*;
 use ast;
-use attr::{ThinAttributes, ThinAttributesExt};
-use codemap::{respan, Span, Spanned};
+use syntax_pos::Span;
+use codemap::{Spanned, respan};
 use parse::token::{self, keywords};
 use ptr::P;
+use tokenstream::*;
 use util::small_vector::SmallVector;
 use util::move_map::MoveMap;
 
@@ -100,10 +101,6 @@ pub trait Folder : Sized {
 
     fn fold_pat(&mut self, p: P<Pat>) -> P<Pat> {
         noop_fold_pat(p, self)
-    }
-
-    fn fold_decl(&mut self, d: P<Decl>) -> SmallVector<P<Decl>> {
-        noop_fold_decl(d, self)
     }
 
     fn fold_expr(&mut self, e: P<Expr>) -> P<Expr> {
@@ -336,8 +333,8 @@ pub fn fold_attrs<T: Folder>(attrs: Vec<Attribute>, fld: &mut T) -> Vec<Attribut
     attrs.move_flat_map(|x| fld.fold_attribute(x))
 }
 
-pub fn fold_thin_attrs<T: Folder>(attrs: ThinAttributes, fld: &mut T) -> ThinAttributes {
-    attrs.map_thin_attrs(|v| fold_attrs(v, fld))
+pub fn fold_thin_attrs<T: Folder>(attrs: ThinVec<Attribute>, fld: &mut T) -> ThinVec<Attribute> {
+    fold_attrs(attrs.into(), fld).into()
 }
 
 pub fn noop_fold_arm<T: Folder>(Arm {attrs, pats, guard, body}: Arm, fld: &mut T) -> Arm {
@@ -347,19 +344,6 @@ pub fn noop_fold_arm<T: Folder>(Arm {attrs, pats, guard, body}: Arm, fld: &mut T
         guard: guard.map(|x| fld.fold_expr(x)),
         body: fld.fold_expr(body),
     }
-}
-
-pub fn noop_fold_decl<T: Folder>(d: P<Decl>, fld: &mut T) -> SmallVector<P<Decl>> {
-    d.and_then(|Spanned {node, span}| match node {
-        DeclKind::Local(l) => SmallVector::one(P(Spanned {
-            node: DeclKind::Local(fld.fold_local(l)),
-            span: fld.new_span(span)
-        })),
-        DeclKind::Item(it) => fld.fold_item(it).into_iter().map(|i| P(Spanned {
-            node: DeclKind::Item(i),
-            span: fld.new_span(span)
-        })).collect()
-    })
 }
 
 pub fn noop_fold_ty_binding<T: Folder>(b: TypeBinding, fld: &mut T) -> TypeBinding {
@@ -389,6 +373,7 @@ pub fn noop_fold_ty<T: Folder>(t: P<Ty>, fld: &mut T) -> P<Ty> {
                     decl: fld.fold_fn_decl(decl)
                 }))
             }
+            TyKind::Never => node,
             TyKind::Tup(tys) => TyKind::Tup(tys.move_map(|ty| fld.fold_ty(ty))),
             TyKind::Paren(ty) => TyKind::Paren(fld.fold_ty(ty)),
             TyKind::Path(qself, path) => {
@@ -412,6 +397,9 @@ pub fn noop_fold_ty<T: Folder>(t: P<Ty>, fld: &mut T) -> P<Ty> {
             }
             TyKind::PolyTraitRef(bounds) => {
                 TyKind::PolyTraitRef(bounds.move_map(|b| fld.fold_ty_param_bound(b)))
+            }
+            TyKind::ImplTrait(bounds) => {
+                TyKind::ImplTrait(bounds.move_map(|b| fld.fold_ty_param_bound(b)))
             }
             TyKind::Mac(mac) => {
                 TyKind::Mac(fld.fold_mac(mac))
@@ -498,7 +486,7 @@ pub fn noop_fold_local<T: Folder>(l: P<Local>, fld: &mut T) -> P<Local> {
         pat: fld.fold_pat(pat),
         init: init.map(|e| fld.fold_expr(e)),
         span: fld.new_span(span),
-        attrs: attrs.map_thin_attrs(|v| fold_attrs(v, fld)),
+        attrs: fold_attrs(attrs.into(), fld).into(),
     })
 }
 
@@ -520,7 +508,6 @@ pub fn noop_fold_mac<T: Folder>(Spanned {node, span}: Mac, fld: &mut T) -> Mac {
         node: Mac_ {
             path: fld.fold_path(node.path),
             tts: fld.fold_tts(&node.tts),
-            ctxt: node.ctxt,
         },
         span: fld.new_span(span)
     }
@@ -572,8 +559,6 @@ pub fn noop_fold_tt<T: Folder>(tt: &TokenTree, fld: &mut T) -> TokenTree {
 }
 
 pub fn noop_fold_tts<T: Folder>(tts: &[TokenTree], fld: &mut T) -> Vec<TokenTree> {
-    // FIXME: Does this have to take a tts slice?
-    // Could use move_map otherwise...
     tts.iter().map(|tt| fld.fold_tt(tt)).collect()
 }
 
@@ -653,7 +638,6 @@ pub fn noop_fold_fn_decl<T: Folder>(decl: P<FnDecl>, fld: &mut T) -> P<FnDecl> {
         output: match output {
             FunctionRetTy::Ty(ty) => FunctionRetTy::Ty(fld.fold_ty(ty)),
             FunctionRetTy::Default(span) => FunctionRetTy::Default(span),
-            FunctionRetTy::None(span) => FunctionRetTy::None(span),
         },
         variadic: variadic
     })
@@ -845,10 +829,9 @@ fn noop_fold_bounds<T: Folder>(bounds: TyParamBounds, folder: &mut T)
 }
 
 pub fn noop_fold_block<T: Folder>(b: P<Block>, folder: &mut T) -> P<Block> {
-    b.map(|Block {id, stmts, expr, rules, span}| Block {
+    b.map(|Block {id, stmts, rules, span}| Block {
         id: folder.new_id(id),
         stmts: stmts.move_flat_map(|s| folder.fold_stmt(s).into_iter()),
-        expr: expr.and_then(|x| folder.fold_opt_expr(x)),
         rules: rules,
         span: folder.new_span(span),
     })
@@ -944,6 +927,9 @@ pub fn noop_fold_trait_item<T: Folder>(i: TraitItem, folder: &mut T)
             TraitItemKind::Type(bounds, default) => {
                 TraitItemKind::Type(folder.fold_bounds(bounds),
                               default.map(|x| folder.fold_ty(x)))
+            }
+            ast::TraitItemKind::Macro(mac) => {
+                TraitItemKind::Macro(folder.fold_mac(mac))
             }
         },
         span: folder.new_span(i.span)
@@ -1088,12 +1074,11 @@ pub fn noop_fold_pat<T: Folder>(p: P<Pat>, folder: &mut T) -> P<Pat> {
                 PatKind::TupleStruct(folder.fold_path(pth),
                         pats.move_map(|x| folder.fold_pat(x)), ddpos)
             }
-            PatKind::Path(pth) => {
-                PatKind::Path(folder.fold_path(pth))
-            }
-            PatKind::QPath(qself, pth) => {
-                let qself = QSelf {ty: folder.fold_ty(qself.ty), .. qself};
-                PatKind::QPath(qself, folder.fold_path(pth))
+            PatKind::Path(opt_qself, pth) => {
+                let opt_qself = opt_qself.map(|qself| {
+                    QSelf { ty: folder.fold_ty(qself.ty), position: qself.position }
+                });
+                PatKind::Path(opt_qself, folder.fold_path(pth))
             }
             PatKind::Struct(pth, fields, etc) => {
                 let pth = folder.fold_path(pth);
@@ -1128,7 +1113,6 @@ pub fn noop_fold_pat<T: Folder>(p: P<Pat>, folder: &mut T) -> P<Pat> {
 
 pub fn noop_fold_expr<T: Folder>(Expr {id, node, span, attrs}: Expr, folder: &mut T) -> Expr {
     Expr {
-        id: folder.new_id(id),
         node: match node {
             ExprKind::Box(e) => {
                 ExprKind::Box(folder.fold_expr(e))
@@ -1255,7 +1239,7 @@ pub fn noop_fold_expr<T: Folder>(Expr {id, node, span, attrs}: Expr, folder: &mu
                 respan(folder.new_span(label.span),
                        folder.fold_ident(label.node)))
             ),
-            ExprKind::Again(opt_ident) => ExprKind::Again(opt_ident.map(|label|
+            ExprKind::Continue(opt_ident) => ExprKind::Continue(opt_ident.map(|label|
                 respan(folder.new_span(label.span),
                        folder.fold_ident(label.node)))
             ),
@@ -1296,11 +1280,21 @@ pub fn noop_fold_expr<T: Folder>(Expr {id, node, span, attrs}: Expr, folder: &mu
                         fields.move_map(|x| folder.fold_field(x)),
                         maybe_expr.map(|x| folder.fold_expr(x)))
             },
-            ExprKind::Paren(ex) => ExprKind::Paren(folder.fold_expr(ex)),
+            ExprKind::Paren(ex) => {
+                let sub_expr = folder.fold_expr(ex);
+                return Expr {
+                    // Nodes that are equal modulo `Paren` sugar no-ops should have the same ids.
+                    id: sub_expr.id,
+                    node: ExprKind::Paren(sub_expr),
+                    span: folder.new_span(span),
+                    attrs: fold_attrs(attrs.into(), folder).into(),
+                };
+            }
             ExprKind::Try(ex) => ExprKind::Try(folder.fold_expr(ex)),
         },
+        id: folder.new_id(id),
         span: folder.new_span(span),
-        attrs: attrs.map_thin_attrs(|v| fold_attrs(v, folder)),
+        attrs: fold_attrs(attrs.into(), folder).into(),
     }
 }
 
@@ -1312,44 +1306,50 @@ pub fn noop_fold_exprs<T: Folder>(es: Vec<P<Expr>>, folder: &mut T) -> Vec<P<Exp
     es.move_flat_map(|e| folder.fold_opt_expr(e))
 }
 
-pub fn noop_fold_stmt<T: Folder>(Spanned {node, span}: Stmt, folder: &mut T)
+pub fn noop_fold_stmt<T: Folder>(Stmt {node, span, id}: Stmt, folder: &mut T)
                                  -> SmallVector<Stmt> {
+    let id = folder.new_id(id);
     let span = folder.new_span(span);
+
     match node {
-        StmtKind::Decl(d, id) => {
-            let id = folder.new_id(id);
-            folder.fold_decl(d).into_iter().map(|d| Spanned {
-                node: StmtKind::Decl(d, id),
-                span: span
-            }).collect()
-        }
-        StmtKind::Expr(e, id) => {
-            let id = folder.new_id(id);
-            if let Some(e) = folder.fold_opt_expr(e) {
-                SmallVector::one(Spanned {
-                    node: StmtKind::Expr(e, id),
-                    span: span
+        StmtKind::Local(local) => SmallVector::one(Stmt {
+            id: id,
+            node: StmtKind::Local(folder.fold_local(local)),
+            span: span,
+        }),
+        StmtKind::Item(item) => folder.fold_item(item).into_iter().map(|item| Stmt {
+            id: id,
+            node: StmtKind::Item(item),
+            span: span,
+        }).collect(),
+        StmtKind::Expr(expr) => {
+            if let Some(expr) = folder.fold_opt_expr(expr) {
+                SmallVector::one(Stmt {
+                    id: id,
+                    node: StmtKind::Expr(expr),
+                    span: span,
                 })
             } else {
                 SmallVector::zero()
             }
         }
-        StmtKind::Semi(e, id) => {
-            let id = folder.new_id(id);
-            if let Some(e) = folder.fold_opt_expr(e) {
-                SmallVector::one(Spanned {
-                    node: StmtKind::Semi(e, id),
-                    span: span
+        StmtKind::Semi(expr) => {
+            if let Some(expr) = folder.fold_opt_expr(expr) {
+                SmallVector::one(Stmt {
+                    id: id,
+                    node: StmtKind::Semi(expr),
+                    span: span,
                 })
             } else {
                 SmallVector::zero()
             }
         }
-        StmtKind::Mac(mac, semi, attrs) => SmallVector::one(Spanned {
-            node: StmtKind::Mac(mac.map(|m| folder.fold_mac(m)),
-                                semi,
-                                attrs.map_thin_attrs(|v| fold_attrs(v, folder))),
-            span: span
+        StmtKind::Mac(mac) => SmallVector::one(Stmt {
+            id: id,
+            node: StmtKind::Mac(mac.map(|(mac, semi, attrs)| {
+                (folder.fold_mac(mac), semi, fold_attrs(attrs.into(), folder).into())
+            })),
+            span: span,
         })
     }
 }

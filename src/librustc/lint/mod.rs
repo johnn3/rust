@@ -33,7 +33,7 @@ pub use self::LintSource::*;
 
 use std::hash;
 use std::ascii::AsciiExt;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 use hir::intravisit::FnKind;
 use syntax::visit as ast_visit;
 use syntax::ast;
@@ -41,7 +41,7 @@ use hir;
 
 pub use lint::context::{LateContext, EarlyContext, LintContext, LintStore,
                         raw_emit_lint, check_crate, check_ast_crate, gather_attrs,
-                        raw_struct_lint, GatherNodeLevels, FutureIncompatibleInfo};
+                        raw_struct_lint, FutureIncompatibleInfo};
 
 /// Specification of a single lint.
 #[derive(Copy, Clone, Debug)]
@@ -195,7 +195,6 @@ pub trait EarlyLintPass: LintPass {
     fn check_stmt(&mut self, _: &EarlyContext, _: &ast::Stmt) { }
     fn check_arm(&mut self, _: &EarlyContext, _: &ast::Arm) { }
     fn check_pat(&mut self, _: &EarlyContext, _: &ast::Pat) { }
-    fn check_decl(&mut self, _: &EarlyContext, _: &ast::Decl) { }
     fn check_expr(&mut self, _: &EarlyContext, _: &ast::Expr) { }
     fn check_expr_post(&mut self, _: &EarlyContext, _: &ast::Expr) { }
     fn check_ty(&mut self, _: &EarlyContext, _: &ast::Ty) { }
@@ -270,7 +269,7 @@ impl LintId {
 }
 
 /// Setting for how to handle a lint.
-#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
 pub enum Level {
     Allow, Warn, Deny, Forbid
 }

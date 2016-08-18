@@ -27,8 +27,9 @@ use sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
 /// Representation of a running or exited child process.
 ///
 /// This structure is used to represent and manage child processes. A child
-/// process is created via the `Command` struct, which configures the spawning
-/// process and can itself be constructed using a builder-style interface.
+/// process is created via the [`Command`] struct, which configures the
+/// spawning process and can itself be constructed using a builder-style
+/// interface.
 ///
 /// # Examples
 ///
@@ -48,13 +49,18 @@ use sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
 ///
 /// # Note
 ///
-/// Take note that there is no implementation of
-/// [`Drop`](../../core/ops/trait.Drop.html) for child processes, so if you
-/// do not ensure the `Child` has exited then it will continue to run, even
-/// after the `Child` handle to the child process has gone out of scope.
+/// Take note that there is no implementation of [`Drop`] for child processes,
+/// so if you do not ensure the `Child` has exited then it will continue to
+/// run, even after the `Child` handle to the child process has gone out of
+/// scope.
 ///
-/// Calling `wait` (or other functions that wrap around it) will make the
-/// parent process wait until the child has actually exited before continuing.
+/// Calling [`wait`][`wait`] (or other functions that wrap around it) will make
+/// the parent process wait until the child has actually exited before
+/// continuing.
+///
+/// [`Command`]: struct.Command.html
+/// [`Drop`]: ../../core/ops/trait.Drop.html
+/// [`wait`]: #method.wait
 #[stable(feature = "process", since = "1.0.0")]
 pub struct Child {
     handle: imp::Process,
@@ -91,7 +97,11 @@ impl IntoInner<imp::Process> for Child {
     fn into_inner(self) -> imp::Process { self.handle }
 }
 
-/// A handle to a child process's stdin
+/// A handle to a child process's stdin. This struct is used in the [`stdin`]
+/// field on [`Child`].
+///
+/// [`Child`]: struct.Child.html
+/// [`stdin`]: struct.Child.html#structfield.stdin
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ChildStdin {
     inner: AnonPipe
@@ -122,7 +132,11 @@ impl FromInner<AnonPipe> for ChildStdin {
     }
 }
 
-/// A handle to a child process's stdout
+/// A handle to a child process's stdout. This struct is used in the [`stdout`]
+/// field on [`Child`].
+///
+/// [`Child`]: struct.Child.html
+/// [`stdout`]: struct.Child.html#structfield.stdout
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ChildStdout {
     inner: AnonPipe
@@ -152,7 +166,11 @@ impl FromInner<AnonPipe> for ChildStdout {
     }
 }
 
-/// A handle to a child process's stderr
+/// A handle to a child process's stderr. This struct is used in the [`stderr`]
+/// field on [`Child`].
+///
+/// [`Child`]: struct.Child.html
+/// [`stderr`]: struct.Child.html#structfield.stderr
 #[stable(feature = "process", since = "1.0.0")]
 pub struct ChildStderr {
     inner: AnonPipe
@@ -182,8 +200,10 @@ impl FromInner<AnonPipe> for ChildStderr {
     }
 }
 
-/// The `Command` type acts as a process builder, providing fine-grained control
-/// over how a new process should be spawned. A default configuration can be
+/// A process builder, providing fine-grained control
+/// over how a new process should be spawned.
+///
+/// A default configuration can be
 /// generated using `Command::new(program)`, where `program` gives a path to the
 /// program to be executed. Additional builder methods allow the configuration
 /// to be changed (for example, by adding arguments) prior to spawning:
@@ -585,6 +605,23 @@ pub struct ExitStatus(imp::ExitStatus);
 impl ExitStatus {
     /// Was termination successful? Signal termination not considered a success,
     /// and success is defined as a zero exit status.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::process::Command;
+    ///
+    /// let status = Command::new("mkdir")
+    ///                      .arg("projects")
+    ///                      .status()
+    ///                      .expect("failed to execute mkdir");
+    ///
+    /// if status.success() {
+    ///     println!("'projects/' directory created");
+    /// } else {
+    ///     println!("failed to create 'projects/' directory");
+    /// }
+    /// ```
     #[stable(feature = "process", since = "1.0.0")]
     pub fn success(&self) -> bool {
         self.0.success()
@@ -711,16 +748,17 @@ impl Child {
     /// ```should_panic
     /// use std::process::{Command, Stdio};
     ///
-    /// let mut child = Command::new("/bin/cat")
-    ///                         .arg("file.txt")
-    ///                         .stdout(Stdio::piped())
-    ///                         .spawn()
-    ///                         .expect("failed to execute child");
+    /// let child = Command::new("/bin/cat")
+    ///     .arg("file.txt")
+    ///     .stdout(Stdio::piped())
+    ///     .spawn()
+    ///     .expect("failed to execute child");
     ///
-    /// let ecode = child.wait_with_output()
-    ///                  .expect("failed to wait on child");
+    /// let output = child
+    ///     .wait_with_output()
+    ///     .expect("failed to wait on child");
     ///
-    /// assert!(ecode.status.success());
+    /// assert!(output.status.success());
     /// ```
     ///
     #[stable(feature = "process", since = "1.0.0")]

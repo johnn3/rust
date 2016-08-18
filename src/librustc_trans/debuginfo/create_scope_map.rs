@@ -16,16 +16,17 @@ use llvm;
 use llvm::debuginfo::{DIScope, DISubprogram};
 use common::{CrateContext, FunctionContext};
 use rustc::hir::pat_util;
-use rustc::mir::repr::{Mir, ScopeId};
+use rustc::mir::repr::{Mir, VisibilityScope};
 use rustc::util::nodemap::NodeMap;
 
 use libc::c_uint;
 use std::ptr;
 
-use syntax::codemap::{Span, Pos};
+use syntax_pos::{Span, Pos};
 use syntax::{ast, codemap};
 
 use rustc_data_structures::bitvec::BitVector;
+use rustc_data_structures::indexed_vec::{Idx, IndexVec};
 use rustc::hir::{self, PatKind};
 
 // This procedure builds the *scope map* for a given function, which maps any
@@ -50,7 +51,7 @@ pub fn create_scope_map(cx: &CrateContext,
     for arg in args {
         pat_util::pat_bindings(&arg.pat, |_, node_id, _, path1| {
             scope_stack.push(ScopeStackEntry { scope_metadata: fn_metadata,
-                                               name: Some(path1.node.unhygienize()) });
+                                               name: Some(path1.node) });
             scope_map.insert(node_id, fn_metadata);
         })
     }
@@ -69,9 +70,9 @@ pub fn create_scope_map(cx: &CrateContext,
 
 /// Produce DIScope DIEs for each MIR Scope which has variables defined in it.
 /// If debuginfo is disabled, the returned vector is empty.
-pub fn create_mir_scopes(fcx: &FunctionContext) -> Vec<DIScope> {
+pub fn create_mir_scopes(fcx: &FunctionContext) -> IndexVec<VisibilityScope, DIScope> {
     let mir = fcx.mir.clone().expect("create_mir_scopes: missing MIR for fn");
-    let mut scopes = vec![ptr::null_mut(); mir.scopes.len()];
+    let mut scopes = IndexVec::from_elem(ptr::null_mut(), &mir.visibility_scopes);
 
     let fn_metadata = match fcx.debug_context {
         FunctionDebugContext::RegularContext(box ref data) => data.fn_metadata,
@@ -82,14 +83,14 @@ pub fn create_mir_scopes(fcx: &FunctionContext) -> Vec<DIScope> {
     };
 
     // Find all the scopes with variables defined in them.
-    let mut has_variables = BitVector::new(mir.scopes.len());
+    let mut has_variables = BitVector::new(mir.visibility_scopes.len());
     for var in &mir.var_decls {
-        has_variables.insert(var.scope.index());
+        has_variables.insert(var.source_info.scope.index());
     }
 
     // Instantiate all scopes.
-    for idx in 0..mir.scopes.len() {
-        let scope = ScopeId::new(idx);
+    for idx in 0..mir.visibility_scopes.len() {
+        let scope = VisibilityScope::new(idx);
         make_mir_scope(fcx.ccx, &mir, &has_variables, fn_metadata, scope, &mut scopes);
     }
 
@@ -100,24 +101,23 @@ fn make_mir_scope(ccx: &CrateContext,
                   mir: &Mir,
                   has_variables: &BitVector,
                   fn_metadata: DISubprogram,
-                  scope: ScopeId,
-                  scopes: &mut [DIScope]) {
-    let idx = scope.index();
-    if !scopes[idx].is_null() {
+                  scope: VisibilityScope,
+                  scopes: &mut IndexVec<VisibilityScope, DIScope>) {
+    if !scopes[scope].is_null() {
         return;
     }
 
-    let scope_data = &mir.scopes[scope];
+    let scope_data = &mir.visibility_scopes[scope];
     let parent_scope = if let Some(parent) = scope_data.parent_scope {
         make_mir_scope(ccx, mir, has_variables, fn_metadata, parent, scopes);
-        scopes[parent.index()]
+        scopes[parent]
     } else {
         // The root is the function itself.
-        scopes[idx] = fn_metadata;
+        scopes[scope] = fn_metadata;
         return;
     };
 
-    if !has_variables.contains(idx) {
+    if !has_variables.contains(scope.index()) {
         // Do not create a DIScope if there are no variables
         // defined in this MIR Scope, to avoid debuginfo bloat.
 
@@ -125,15 +125,15 @@ fn make_mir_scope(ccx: &CrateContext,
         // our parent is the root, because we might want to
         // put arguments in the root and not have shadowing.
         if parent_scope != fn_metadata {
-            scopes[idx] = parent_scope;
+            scopes[scope] = parent_scope;
             return;
         }
     }
 
     let loc = span_start(ccx, scope_data.span);
-    let file_metadata = file_metadata(ccx, &loc.file.name);
-    scopes[idx] = unsafe {
-        llvm::LLVMDIBuilderCreateLexicalBlock(
+    scopes[scope] = unsafe {
+    let file_metadata = file_metadata(ccx, &loc.file.name, &loc.file.abs_path);
+        llvm::LLVMRustDIBuilderCreateLexicalBlock(
             DIB(ccx),
             parent_scope,
             file_metadata,
@@ -152,11 +152,11 @@ fn with_new_scope<F>(cx: &CrateContext,
 {
     // Create a new lexical scope and push it onto the stack
     let loc = span_start(cx, scope_span);
-    let file_metadata = file_metadata(cx, &loc.file.name);
+    let file_metadata = file_metadata(cx, &loc.file.name, &loc.file.abs_path);
     let parent_scope = scope_stack.last().unwrap().scope_metadata;
 
     let scope_metadata = unsafe {
-        llvm::LLVMDIBuilderCreateLexicalBlock(
+        llvm::LLVMRustDIBuilderCreateLexicalBlock(
             DIB(cx),
             parent_scope,
             file_metadata,
@@ -260,7 +260,7 @@ fn walk_pattern(cx: &CrateContext,
             // N.B.: this comparison must be UNhygienic... because
             // gdb knows nothing about the context, so any two
             // variables with the same name will cause the problem.
-            let name = path1.node.unhygienize();
+            let name = path1.node;
             let need_new_scope = scope_stack
                 .iter()
                 .any(|entry| entry.name == Some(name));
@@ -268,11 +268,11 @@ fn walk_pattern(cx: &CrateContext,
             if need_new_scope {
                 // Create a new lexical scope and push it onto the stack
                 let loc = span_start(cx, pat.span);
-                let file_metadata = file_metadata(cx, &loc.file.name);
+                let file_metadata = file_metadata(cx, &loc.file.name, &loc.file.abs_path);
                 let parent_scope = scope_stack.last().unwrap().scope_metadata;
 
                 let scope_metadata = unsafe {
-                    llvm::LLVMDIBuilderCreateLexicalBlock(
+                    llvm::LLVMRustDIBuilderCreateLexicalBlock(
                         DIB(cx),
                         parent_scope,
                         file_metadata,
@@ -313,7 +313,7 @@ fn walk_pattern(cx: &CrateContext,
             }
         }
 
-        PatKind::Path(..) | PatKind::QPath(..) => {
+        PatKind::Path(..) => {
             scope_map.insert(pat.id, scope_stack.last().unwrap().scope_metadata);
         }
 

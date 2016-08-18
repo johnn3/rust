@@ -12,8 +12,8 @@ use borrowck::BorrowckCtxt;
 
 use syntax::ast::{self, MetaItem};
 use syntax::attr::AttrMetaMethods;
-use syntax::codemap::{Span, DUMMY_SP};
 use syntax::ptr::P;
+use syntax_pos::{Span, DUMMY_SP};
 
 use rustc::hir;
 use rustc::hir::intravisit::{FnKind};
@@ -111,7 +111,7 @@ pub fn borrowck_mir<'a, 'tcx: 'a>(
         flow_uninits: flow_uninits,
     };
 
-    for bb in mir.all_basic_blocks() {
+    for bb in mir.basic_blocks().indices() {
         mbcx.process_basic_block(bb);
     }
 
@@ -180,8 +180,8 @@ pub struct MirBorrowckCtxt<'b, 'a: 'b, 'tcx: 'a> {
 
 impl<'b, 'a: 'b, 'tcx: 'a> MirBorrowckCtxt<'b, 'a, 'tcx> {
     fn process_basic_block(&mut self, bb: BasicBlock) {
-        let &BasicBlockData { ref statements, ref terminator, is_cleanup: _ } =
-            self.mir.basic_block_data(bb);
+        let BasicBlockData { ref statements, ref terminator, is_cleanup: _ } =
+            self.mir[bb];
         for stmt in statements {
             self.process_statement(bb, stmt);
         }
@@ -235,6 +235,45 @@ fn move_path_children_matching<'tcx, F>(move_paths: &MovePathData<'tcx>,
     None
 }
 
+/// When enumerating the child fragments of a path, don't recurse into
+/// paths (1.) past arrays, slices, and pointers, nor (2.) into a type
+/// that implements `Drop`.
+///
+/// Lvalues behind references or arrays are not tracked by elaboration
+/// and are always assumed to be initialized when accessible. As
+/// references and indexes can be reseated, trying to track them can
+/// only lead to trouble.
+///
+/// Lvalues behind ADT's with a Drop impl are not tracked by
+/// elaboration since they can never have a drop-flag state that
+/// differs from that of the parent with the Drop impl.
+///
+/// In both cases, the contents can only be accessed if and only if
+/// their parents are initialized. This implies for example that there
+/// is no need to maintain separate drop flags to track such state.
+///
+/// FIXME: we have to do something for moving slice patterns.
+fn lvalue_contents_drop_state_cannot_differ<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                                      mir: &Mir<'tcx>,
+                                                      lv: &repr::Lvalue<'tcx>) -> bool {
+    let ty = lv.ty(mir, tcx).to_ty(tcx);
+    match ty.sty {
+        ty::TyArray(..) | ty::TySlice(..) | ty::TyRef(..) | ty::TyRawPtr(..) => {
+            debug!("lvalue_contents_drop_state_cannot_differ lv: {:?} ty: {:?} refd => false",
+                   lv, ty);
+            true
+        }
+        ty::TyStruct(def, _) | ty::TyEnum(def, _) if def.has_dtor() => {
+            debug!("lvalue_contents_drop_state_cannot_differ lv: {:?} ty: {:?} Drop => false",
+                   lv, ty);
+            true
+        }
+        _ => {
+            false
+        }
+    }
+}
+
 fn on_all_children_bits<'a, 'tcx, F>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     mir: &Mir<'tcx>,
@@ -251,17 +290,7 @@ fn on_all_children_bits<'a, 'tcx, F>(
     {
         match move_data.move_paths[path].content {
             MovePathContent::Lvalue(ref lvalue) => {
-                match mir.lvalue_ty(tcx, lvalue).to_ty(tcx).sty {
-                    // don't trace paths past arrays, slices, and
-                    // pointers. They can only be accessed while
-                    // their parents are initialized.
-                    //
-                    // FIXME: we have to do something for moving
-                    // slice patterns.
-                    ty::TyArray(..) | ty::TySlice(..) |
-                    ty::TyRef(..) | ty::TyRawPtr(..) => true,
-                    _ => false
-                }
+                lvalue_contents_drop_state_cannot_differ(tcx, mir, lvalue)
             }
             _ => true
         }
@@ -298,8 +327,8 @@ fn drop_flag_effects_for_function_entry<'a, 'tcx, F>(
     where F: FnMut(MovePathIndex, DropFlagState)
 {
     let move_data = &ctxt.move_data;
-    for i in 0..(mir.arg_decls.len() as u32) {
-        let lvalue = repr::Lvalue::Arg(i);
+    for (arg, _) in mir.arg_decls.iter_enumerated() {
+        let lvalue = repr::Lvalue::Arg(arg);
         let move_path_index = move_data.rev_lookup.find(&lvalue);
         on_all_children_bits(tcx, mir, move_data,
                              move_path_index,
@@ -326,7 +355,7 @@ fn drop_flag_effects_for_location<'a, 'tcx, F>(
 
         // don't move out of non-Copy things
         if let MovePathContent::Lvalue(ref lvalue) = move_data.move_paths[path].content {
-            let ty = mir.lvalue_ty(tcx, lvalue).to_ty(tcx);
+            let ty = lvalue.ty(mir, tcx).to_ty(tcx);
             if !ty.moves_by_default(tcx, param_env, DUMMY_SP) {
                 continue;
             }
@@ -337,19 +366,24 @@ fn drop_flag_effects_for_location<'a, 'tcx, F>(
                              |moi| callback(moi, DropFlagState::Absent))
     }
 
-    let bb = mir.basic_block_data(loc.block);
-    match bb.statements.get(loc.index) {
+    let block = &mir[loc.block];
+    match block.statements.get(loc.index) {
         Some(stmt) => match stmt.kind {
+            repr::StatementKind::SetDiscriminant{ .. } => {
+                span_bug!(stmt.source_info.span, "SetDiscrimant should not exist during borrowck");
+            }
             repr::StatementKind::Assign(ref lvalue, _) => {
                 debug!("drop_flag_effects: assignment {:?}", stmt);
                  on_all_children_bits(tcx, mir, move_data,
                                      move_data.rev_lookup.find(lvalue),
                                      |moi| callback(moi, DropFlagState::Present))
             }
+            repr::StatementKind::StorageLive(_) |
+            repr::StatementKind::StorageDead(_) => {}
         },
         None => {
-            debug!("drop_flag_effects: replace {:?}", bb.terminator());
-            match bb.terminator().kind {
+            debug!("drop_flag_effects: replace {:?}", block.terminator());
+            match block.terminator().kind {
                 repr::TerminatorKind::DropAndReplace { ref location, .. } => {
                     on_all_children_bits(tcx, mir, move_data,
                                          move_data.rev_lookup.find(location),

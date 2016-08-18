@@ -25,19 +25,23 @@ use time::Duration;
 
 #[cfg(any(target_os = "dragonfly", target_os = "freebsd",
           target_os = "ios", target_os = "macos",
-          target_os = "openbsd", target_os = "netbsd"))]
+          target_os = "openbsd", target_os = "netbsd",
+          target_os = "solaris"))]
 use sys::net::netc::IPV6_JOIN_GROUP as IPV6_ADD_MEMBERSHIP;
 #[cfg(not(any(target_os = "dragonfly", target_os = "freebsd",
               target_os = "ios", target_os = "macos",
-          target_os = "openbsd", target_os = "netbsd")))]
+              target_os = "openbsd", target_os = "netbsd",
+              target_os = "solaris")))]
 use sys::net::netc::IPV6_ADD_MEMBERSHIP;
 #[cfg(any(target_os = "dragonfly", target_os = "freebsd",
           target_os = "ios", target_os = "macos",
-          target_os = "openbsd", target_os = "netbsd"))]
+          target_os = "openbsd", target_os = "netbsd",
+          target_os = "solaris"))]
 use sys::net::netc::IPV6_LEAVE_GROUP as IPV6_DROP_MEMBERSHIP;
 #[cfg(not(any(target_os = "dragonfly", target_os = "freebsd",
               target_os = "ios", target_os = "macos",
-          target_os = "openbsd", target_os = "netbsd")))]
+              target_os = "openbsd", target_os = "netbsd",
+              target_os = "solaris")))]
 use sys::net::netc::IPV6_DROP_MEMBERSHIP;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -119,14 +123,22 @@ pub struct LookupHost {
 }
 
 impl Iterator for LookupHost {
-    type Item = io::Result<SocketAddr>;
-    fn next(&mut self) -> Option<io::Result<SocketAddr>> {
-        unsafe {
-            if self.cur.is_null() { return None }
-            let ret = sockaddr_to_addr(mem::transmute((*self.cur).ai_addr),
-                                       (*self.cur).ai_addrlen as usize);
-            self.cur = (*self.cur).ai_next as *mut c::addrinfo;
-            Some(ret)
+    type Item = SocketAddr;
+    fn next(&mut self) -> Option<SocketAddr> {
+        loop {
+            unsafe {
+                let cur = match self.cur.as_ref() {
+                    None => return None,
+                    Some(c) => c,
+                };
+                self.cur = cur.ai_next;
+                match sockaddr_to_addr(mem::transmute(cur.ai_addr),
+                                       cur.ai_addrlen as usize)
+                {
+                    Ok(addr) => return Some(addr),
+                    Err(_) => continue,
+                }
+            }
         }
     }
 }
@@ -144,9 +156,19 @@ pub fn lookup_host(host: &str) -> io::Result<LookupHost> {
     init();
 
     let c_host = CString::new(host)?;
+    let hints = c::addrinfo {
+        ai_flags: 0,
+        ai_family: 0,
+        ai_socktype: c::SOCK_STREAM,
+        ai_protocol: 0,
+        ai_addrlen: 0,
+        ai_addr: ptr::null_mut(),
+        ai_canonname: ptr::null_mut(),
+        ai_next: ptr::null_mut()
+    };
     let mut res = ptr::null_mut();
     unsafe {
-        cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), ptr::null(),
+        cvt_gai(c::getaddrinfo(c_host.as_ptr(), ptr::null(), &hints,
                                &mut res))?;
         Ok(LookupHost { original: res, cur: res })
     }
@@ -581,5 +603,24 @@ impl fmt::Debug for UdpSocket {
         let name = if cfg!(windows) {"socket"} else {"fd"};
         res.field(name, &self.inner.as_inner())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prelude::v1::*;
+
+    use super::*;
+    use collections::HashMap;
+
+    #[test]
+    fn no_lookup_host_duplicates() {
+        let mut addrs = HashMap::new();
+        let lh = match lookup_host("localhost") {
+            Ok(lh) => lh,
+            Err(e) => panic!("couldn't resolve `localhost': {}", e)
+        };
+        let _na = lh.map(|sa| *addrs.entry(sa).or_insert(0) += 1).count();
+        assert!(addrs.values().filter(|&&v| v > 1).count() == 0);
     }
 }

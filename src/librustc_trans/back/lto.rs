@@ -22,12 +22,12 @@ use libc;
 use flate;
 
 use std::ffi::CString;
+use std::path::Path;
 
 pub fn run(sess: &session::Session, llmod: ModuleRef,
            tm: TargetMachineRef, reachable: &[String],
            config: &ModuleConfig,
-           name_extra: &str,
-           output_names: &config::OutputFilenames) {
+           temp_no_opt_bc_filename: &Path) {
     if sess.opts.cg.prefer_dynamic {
         sess.struct_err("cannot prefer dynamic linking when performing LTO")
             .note("only 'staticlib', 'bin', and 'cdylib' outputs are \
@@ -52,7 +52,12 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
     // For each of our upstream dependencies, find the corresponding rlib and
     // load the bitcode from the archive. Then merge it into the current LLVM
     // module that we've got.
-    link::each_linked_rlib(sess, &mut |_, path| {
+    link::each_linked_rlib(sess, &mut |cnum, path| {
+        // `#![no_builtins]` crates don't participate in LTO.
+        if sess.cstore.is_no_builtins(cnum) {
+            return;
+        }
+
         let archive = ArchiveRO::open(&path).expect("wanted an rlib");
         let bytecodes = archive.iter().filter_map(|child| {
             child.ok().and_then(|c| c.name().map(|name| (name, c)))
@@ -132,8 +137,7 @@ pub fn run(sess: &session::Session, llmod: ModuleRef,
     }
 
     if sess.opts.cg.save_temps {
-        let path = output_names.with_extension(&format!("{}.no-opt.lto.bc", name_extra));
-        let cstr = path2cstr(&path);
+        let cstr = path2cstr(temp_no_opt_bc_filename);
         unsafe {
             llvm::LLVMWriteBitcodeToFile(llmod, cstr.as_ptr());
         }

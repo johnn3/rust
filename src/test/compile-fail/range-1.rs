@@ -17,12 +17,11 @@ pub fn main() {
 
     // Bool => does not implement iterator.
     for i in false..true {}
-    //~^ ERROR `bool: std::num::One` is not satisfied
-    //~^^ ERROR `bool: std::iter::Step` is not satisfied
-    //~^^^ ERROR `for<'a> &'a bool: std::ops::Add` is not satisfied
+    //~^ ERROR `bool: std::iter::Step` is not satisfied
+    //~^^ ERROR `for<'a> &'a bool: std::ops::Add` is not satisfied
 
     // Unsized type.
     let arr: &[_] = &[1, 2, 3];
     let range = *arr..;
-    //~^ ERROR `[_]: std::marker::Sized` is not satisfied
+    //~^ ERROR `[{integer}]: std::marker::Sized` is not satisfied
 }

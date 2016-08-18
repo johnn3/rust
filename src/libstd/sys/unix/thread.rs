@@ -12,7 +12,6 @@ use prelude::v1::*;
 
 use alloc::boxed::FnBox;
 use cmp;
-#[cfg(not(any(target_env = "newlib", target_os = "solaris")))]
 use ffi::CStr;
 use io;
 use libc;
@@ -82,8 +81,7 @@ impl Thread {
     }
 
     #[cfg(any(target_os = "linux",
-              target_os = "android",
-              target_os = "emscripten"))]
+              target_os = "android"))]
     pub fn set_name(name: &CStr) {
         const PR_SET_NAME: libc::c_int = 15;
         // pthread wrapper only appeared in glibc 2.12, so we use syscall
@@ -119,22 +117,31 @@ impl Thread {
                                      name.as_ptr() as *mut libc::c_void);
         }
     }
-    #[cfg(any(target_env = "newlib", target_os = "solaris"))]
+    #[cfg(any(target_env = "newlib", target_os = "solaris", target_os = "emscripten"))]
     pub fn set_name(_name: &CStr) {
-        // Newlib and Illumos has no way to set a thread name.
+        // Newlib, Illumos and Emscripten have no way to set a thread name.
     }
 
     pub fn sleep(dur: Duration) {
-        let mut ts = libc::timespec {
-            tv_sec: dur.as_secs() as libc::time_t,
-            tv_nsec: dur.subsec_nanos() as libc::c_long,
-        };
+        let mut secs = dur.as_secs();
+        let mut nsecs = dur.subsec_nanos() as libc::c_long;
 
         // If we're awoken with a signal then the return value will be -1 and
         // nanosleep will fill in `ts` with the remaining time.
         unsafe {
-            while libc::nanosleep(&ts, &mut ts) == -1 {
-                assert_eq!(os::errno(), libc::EINTR);
+            while secs > 0 || nsecs > 0 {
+                let mut ts = libc::timespec {
+                    tv_sec: cmp::min(libc::time_t::max_value() as u64, secs) as libc::time_t,
+                    tv_nsec: nsecs,
+                };
+                secs -= ts.tv_sec as u64;
+                if libc::nanosleep(&ts, &mut ts) == -1 {
+                    assert_eq!(os::errno(), libc::EINTR);
+                    secs += ts.tv_sec as u64;
+                    nsecs = ts.tv_nsec;
+                } else {
+                    nsecs = 0;
+                }
             }
         }
     }

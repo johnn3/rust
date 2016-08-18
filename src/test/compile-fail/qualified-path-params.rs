@@ -27,7 +27,8 @@ impl S {
 
 fn main() {
     match 10 {
-        <S as Tr>::A::f::<u8> => {} //~ ERROR `f` is not an associated const
+        <S as Tr>::A::f::<u8> => {}
+        //~^ ERROR `Tr::A::f<u8>` does not name a unit variant, unit struct or a constant
         0 ... <S as Tr>::A::f::<u8> => {} //~ ERROR only char and numeric types are allowed in range
     }
 }

@@ -19,11 +19,11 @@ use base;
 use build;
 use callee::{Callee, CalleeData, Fn, Intrinsic, NamedTupleConstructor, Virtual};
 use common::{self, Block, BlockAndBuilder, LandingPad};
-use common::{C_bool, C_str_slice, C_struct, C_u32, C_uint, C_undef};
+use common::{C_bool, C_str_slice, C_struct, C_u32, C_undef};
 use consts;
 use debuginfo::DebugLoc;
 use Disr;
-use machine::{llalign_of_min, llbitsize_of_real, llsize_of_store};
+use machine::{llalign_of_min, llbitsize_of_real};
 use meth;
 use type_of;
 use glue;
@@ -32,20 +32,18 @@ use type_::Type;
 use rustc_data_structures::fnv::FnvHashMap;
 use syntax::parse::token;
 
-use super::{MirContext, TempRef};
+use super::{MirContext, LocalRef};
 use super::analyze::CleanupKind;
 use super::constant::Const;
 use super::lvalue::{LvalueRef, load_fat_ptr};
 use super::operand::OperandRef;
 use super::operand::OperandValue::*;
 
-use std::cmp;
-
 impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
     pub fn trans_block(&mut self, bb: mir::BasicBlock) {
         let mut bcx = self.bcx(bb);
         let mir = self.mir.clone();
-        let data = mir.basic_block_data(bb);
+        let data = &mir[bb];
 
         debug!("trans_block({:?}={:?})", bb, data);
 
@@ -54,9 +52,9 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         let cleanup_bundle = bcx.lpad().and_then(|l| l.bundle());
 
         let funclet_br = |this: &Self, bcx: BlockAndBuilder, bb: mir::BasicBlock| {
-            let lltarget = this.blocks[bb.index()].llbb;
+            let lltarget = this.blocks[bb].llbb;
             if let Some(cp) = cleanup_pad {
-                match this.cleanup_kind(bb) {
+                match this.cleanup_kinds[bb] {
                     CleanupKind::Funclet => {
                         // micro-optimization: generate a `ret` rather than a jump
                         // to a return block
@@ -71,10 +69,10 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         };
 
         let llblock = |this: &mut Self, target: mir::BasicBlock| {
-            let lltarget = this.blocks[target.index()].llbb;
+            let lltarget = this.blocks[target].llbb;
 
             if let Some(cp) = cleanup_pad {
-                match this.cleanup_kind(target) {
+                match this.cleanup_kinds[target] {
                     CleanupKind::Funclet => {
                         // MSVC cross-funclet jump - need a trampoline
 
@@ -91,7 +89,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 }
             } else {
                 if let (CleanupKind::NotCleanup, CleanupKind::Funclet) =
-                    (this.cleanup_kind(bb), this.cleanup_kind(target))
+                    (this.cleanup_kinds[bb], this.cleanup_kinds[target])
                 {
                     // jump *into* cleanup - need a landing pad if GNU
                     this.landing_pad_to(target).llbb
@@ -108,8 +106,8 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         let terminator = data.terminator();
         debug!("trans_block: terminator: {:?}", terminator);
 
-        let debug_loc = DebugLoc::ScopeAt(self.scopes[terminator.scope.index()],
-                                          terminator.span);
+        let span = terminator.source_info.span;
+        let debug_loc = self.debug_loc(terminator.source_info);
         debug_loc.apply_to_bcx(&bcx);
         debug_loc.apply(bcx.fcx());
         match terminator.kind {
@@ -188,19 +186,60 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
             }
 
             mir::TerminatorKind::Return => {
-                bcx.with_block(|bcx| {
-                    self.fcx.build_return_block(bcx, debug_loc);
-                })
+                let ret = bcx.fcx().fn_ty.ret;
+                if ret.is_ignore() || ret.is_indirect() {
+                    bcx.ret_void();
+                    return;
+                }
+
+                let llval = if let Some(cast_ty) = ret.cast {
+                    let index = mir.local_index(&mir::Lvalue::ReturnPointer).unwrap();
+                    let op = match self.locals[index] {
+                        LocalRef::Operand(Some(op)) => op,
+                        LocalRef::Operand(None) => bug!("use of return before def"),
+                        LocalRef::Lvalue(tr_lvalue) => {
+                            OperandRef {
+                                val: Ref(tr_lvalue.llval),
+                                ty: tr_lvalue.ty.to_ty(bcx.tcx())
+                            }
+                        }
+                    };
+                    let llslot = match op.val {
+                        Immediate(_) | Pair(..) => {
+                            let llscratch = build::AllocaFcx(bcx.fcx(), ret.original_ty, "ret");
+                            self.store_operand(&bcx, llscratch, op);
+                            llscratch
+                        }
+                        Ref(llval) => llval
+                    };
+                    let load = bcx.load(bcx.pointercast(llslot, cast_ty.ptr_to()));
+                    let llalign = llalign_of_min(bcx.ccx(), ret.ty);
+                    unsafe {
+                        llvm::LLVMSetAlignment(load, llalign);
+                    }
+                    load
+                } else {
+                    let op = self.trans_consume(&bcx, &mir::Lvalue::ReturnPointer);
+                    op.pack_if_pair(&bcx).immediate()
+                };
+                bcx.ret(llval);
+            }
+
+            mir::TerminatorKind::Unreachable => {
+                bcx.unreachable();
             }
 
             mir::TerminatorKind::Drop { ref location, target, unwind } => {
-                let lvalue = self.trans_lvalue(&bcx, location);
-                let ty = lvalue.ty.to_ty(bcx.tcx());
+                let ty = location.ty(&mir, bcx.tcx()).to_ty(bcx.tcx());
+                let ty = bcx.monomorphize(&ty);
+
                 // Double check for necessity to drop
                 if !glue::type_needs_drop(bcx.tcx(), ty) {
                     funclet_br(self, bcx, target);
                     return;
                 }
+
+                let lvalue = self.trans_lvalue(&bcx, location);
                 let drop_fn = glue::get_drop_glue(bcx.ccx(), ty);
                 let drop_ty = glue::get_drop_glue_type(bcx.tcx(), ty);
                 let llvalue = if drop_ty != ty {
@@ -211,7 +250,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 if let Some(unwind) = unwind {
                     bcx.invoke(drop_fn,
                                &[llvalue],
-                               self.blocks[target.index()].llbb,
+                               self.blocks[target].llbb,
                                llblock(self, unwind),
                                cleanup_bundle);
                 } else {
@@ -222,7 +261,23 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
             mir::TerminatorKind::Assert { ref cond, expected, ref msg, target, cleanup } => {
                 let cond = self.trans_operand(&bcx, cond).immediate();
-                let const_cond = common::const_to_opt_uint(cond).map(|c| c == 1);
+                let mut const_cond = common::const_to_opt_uint(cond).map(|c| c == 1);
+
+                // This case can currently arise only from functions marked
+                // with #[rustc_inherit_overflow_checks] and inlined from
+                // another crate (mostly core::num generic/#[inline] fns),
+                // while the current crate doesn't use overflow checks.
+                // NOTE: Unlike binops, negation doesn't have its own
+                // checked operation, just a comparison with the minimum
+                // value, so we have to check for the assert message.
+                if !bcx.ccx().check_overflow() {
+                    use rustc_const_math::ConstMathErr::Overflow;
+                    use rustc_const_math::Op::Neg;
+
+                    if let mir::AssertMessage::Math(Overflow(Neg)) = *msg {
+                        const_cond = Some(expected);
+                    }
+                }
 
                 // Don't translate the panic block if success if known.
                 if const_cond == Some(expected) {
@@ -245,9 +300,10 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
                 // After this point, bcx is the block for the call to panic.
                 bcx = panic_block.build();
+                debug_loc.apply_to_bcx(&bcx);
 
                 // Get the location information.
-                let loc = bcx.sess().codemap().lookup_char_pos(terminator.span.lo);
+                let loc = bcx.sess().codemap().lookup_char_pos(span.lo);
                 let filename = token::intern_and_get_ident(&loc.file.name);
                 let filename = C_str_slice(bcx.ccx(), filename);
                 let line = C_u32(bcx.ccx(), loc.line as u32);
@@ -298,15 +354,14 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 // is also constant, then we can produce a warning.
                 if const_cond == Some(!expected) {
                     if let Some(err) = const_err {
-                        let _ = consts::const_err(bcx.ccx(),
-                                                  terminator.span,
+                        let _ = consts::const_err(bcx.ccx(), span,
                                                   Err::<(), _>(err),
                                                   consts::TrueConst::No);
                     }
                 }
 
                 // Obtain the panic entry point.
-                let def_id = common::langcall(bcx.tcx(), Some(terminator.span), "", lang_item);
+                let def_id = common::langcall(bcx.tcx(), Some(span), "", lang_item);
                 let callee = Callee::def(bcx.ccx(), def_id,
                     bcx.ccx().empty_substs_for_def_id(def_id));
                 let llfn = callee.reify(bcx.ccx()).val;
@@ -378,7 +433,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
                 let extra_args = &args[sig.inputs.len()..];
                 let extra_args = extra_args.iter().map(|op_arg| {
-                    let op_ty = self.mir.operand_ty(bcx.tcx(), op_arg);
+                    let op_ty = op_arg.ty(&self.mir, bcx.tcx());
                     bcx.monomorphize(&op_ty)
                 }).collect::<Vec<_>>();
                 let fn_ty = callee.direct_fn_type(bcx.ccx(), &extra_args);
@@ -419,8 +474,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                     if is_shuffle && idx == 2 {
                         match *arg {
                             mir::Operand::Consume(_) => {
-                                span_bug!(terminator.span,
-                                          "shuffle indices must be constant");
+                                span_bug!(span, "shuffle indices must be constant");
                             }
                             mir::Operand::Constant(ref constant) => {
                                 let val = self.trans_constant(&bcx, constant);
@@ -471,7 +525,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                             // Make a fake operand for store_return
                             let op = OperandRef {
                                 val: Ref(dst),
-                                ty: sig.output.unwrap()
+                                ty: sig.output,
                             };
                             self.store_return(&bcx, ret_dest, fn_ty.ret, op);
                         }
@@ -492,7 +546,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 // Many different ways to call a function handled here
                 if let &Some(cleanup) = cleanup {
                     let ret_bcx = if let Some((_, target)) = *destination {
-                        self.blocks[target.index()]
+                        self.blocks[target]
                     } else {
                         self.unreachable_block()
                     };
@@ -509,7 +563,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                             debug_loc.apply_to_bcx(ret_bcx);
                             let op = OperandRef {
                                 val: Immediate(invokeret),
-                                ty: sig.output.unwrap()
+                                ty: sig.output,
                             };
                             self.store_return(&ret_bcx, ret_dest, fn_ty.ret, op);
                         });
@@ -520,7 +574,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                     if let Some((_, target)) = *destination {
                         let op = OperandRef {
                             val: Immediate(llret),
-                            ty: sig.output.unwrap()
+                            ty: sig.output,
                         };
                         self.store_return(&bcx, ret_dest, fn_ty.ret, op);
                         funclet_br(self, bcx, target);
@@ -534,7 +588,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
     fn trans_argument(&mut self,
                       bcx: &BlockAndBuilder<'bcx, 'tcx>,
-                      mut op: OperandRef<'tcx>,
+                      op: OperandRef<'tcx>,
                       llargs: &mut Vec<ValueRef>,
                       fn_ty: &FnType,
                       next_idx: &mut usize,
@@ -562,8 +616,6 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 self.trans_argument(bcx, imm_op(meta), llargs, fn_ty, next_idx, callee);
                 return;
             }
-
-            op = op.pack_if_pair(bcx);
         }
 
         let arg = &fn_ty.args[*next_idx];
@@ -580,14 +632,16 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
         // Force by-ref if we have to load through a cast pointer.
         let (mut llval, by_ref) = match op.val {
-            Immediate(llval) if arg.is_indirect() || arg.cast.is_some() => {
-                let llscratch = build::AllocaFcx(bcx.fcx(), arg.original_ty, "arg");
-                bcx.store(llval, llscratch);
-                (llscratch, true)
+            Immediate(_) | Pair(..) => {
+                if arg.is_indirect() || arg.cast.is_some() {
+                    let llscratch = build::AllocaFcx(bcx.fcx(), arg.original_ty, "arg");
+                    self.store_operand(bcx, llscratch, op);
+                    (llscratch, true)
+                } else {
+                    (op.pack_if_pair(bcx).immediate(), false)
+                }
             }
-            Immediate(llval) => (llval, false),
-            Ref(llval) => (llval, true),
-            Pair(..) => bug!("pairs handled above")
+            Ref(llval) => (llval, true)
         };
 
         if by_ref && !arg.is_indirect() {
@@ -697,27 +751,23 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         }
     }
 
-    fn cleanup_kind(&self, bb: mir::BasicBlock) -> CleanupKind {
-        self.cleanup_kinds[bb.index()]
-    }
-
     /// Return the landingpad wrapper around the given basic block
     ///
     /// No-op in MSVC SEH scheme.
     fn landing_pad_to(&mut self, target_bb: mir::BasicBlock) -> Block<'bcx, 'tcx>
     {
-        if let Some(block) = self.landing_pads[target_bb.index()] {
+        if let Some(block) = self.landing_pads[target_bb] {
             return block;
         }
 
         if base::wants_msvc_seh(self.fcx.ccx.sess()) {
-            return self.blocks[target_bb.index()];
+            return self.blocks[target_bb];
         }
 
         let target = self.bcx(target_bb);
 
         let block = self.fcx.new_block("cleanup", None);
-        self.landing_pads[target_bb.index()] = Some(block);
+        self.landing_pads[target_bb] = Some(block);
 
         let bcx = block.build();
         let ccx = bcx.ccx();
@@ -733,10 +783,10 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
     pub fn init_cpad(&mut self, bb: mir::BasicBlock) {
         let bcx = self.bcx(bb);
-        let data = self.mir.basic_block_data(bb);
+        let data = &self.mir[bb];
         debug!("init_cpad({:?})", data);
 
-        match self.cleanup_kinds[bb.index()] {
+        match self.cleanup_kinds[bb] {
             CleanupKind::NotCleanup => {
                 bcx.set_lpad(None)
             }
@@ -767,7 +817,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
     }
 
     fn bcx(&self, bb: mir::BasicBlock) -> BlockAndBuilder<'bcx, 'tcx> {
-        self.blocks[bb.index()].build()
+        self.blocks[bb].build()
     }
 
     fn make_return_dest(&mut self, bcx: &BlockAndBuilder<'bcx, 'tcx>,
@@ -777,42 +827,39 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         if fn_ret_ty.is_ignore() {
             return ReturnDest::Nothing;
         }
-        let dest = match *dest {
-            mir::Lvalue::Temp(idx) => {
-                let lvalue_ty = self.mir.lvalue_ty(bcx.tcx(), dest);
-                let lvalue_ty = bcx.monomorphize(&lvalue_ty);
-                let ret_ty = lvalue_ty.to_ty(bcx.tcx());
-                match self.temps[idx as usize] {
-                    TempRef::Lvalue(dest) => dest,
-                    TempRef::Operand(None) => {
-                        // Handle temporary lvalues, specifically Operand ones, as
-                        // they don't have allocas
-                        return if fn_ret_ty.is_indirect() {
-                            // Odd, but possible, case, we have an operand temporary,
-                            // but the calling convention has an indirect return.
-                            let tmp = bcx.with_block(|bcx| {
-                                base::alloc_ty(bcx, ret_ty, "tmp_ret")
-                            });
-                            llargs.push(tmp);
-                            ReturnDest::IndirectOperand(tmp, idx)
-                        } else if is_intrinsic {
-                            // Currently, intrinsics always need a location to store
-                            // the result. so we create a temporary alloca for the
-                            // result
-                            let tmp = bcx.with_block(|bcx| {
-                                base::alloc_ty(bcx, ret_ty, "tmp_ret")
-                            });
-                            ReturnDest::IndirectOperand(tmp, idx)
-                        } else {
-                            ReturnDest::DirectOperand(idx)
-                        };
-                    }
-                    TempRef::Operand(Some(_)) => {
-                        bug!("lvalue temp already assigned to");
-                    }
+        let dest = if let Some(index) = self.mir.local_index(dest) {
+            let ret_ty = self.monomorphized_lvalue_ty(dest);
+            match self.locals[index] {
+                LocalRef::Lvalue(dest) => dest,
+                LocalRef::Operand(None) => {
+                    // Handle temporary lvalues, specifically Operand ones, as
+                    // they don't have allocas
+                    return if fn_ret_ty.is_indirect() {
+                        // Odd, but possible, case, we have an operand temporary,
+                        // but the calling convention has an indirect return.
+                        let tmp = bcx.with_block(|bcx| {
+                            base::alloc_ty(bcx, ret_ty, "tmp_ret")
+                        });
+                        llargs.push(tmp);
+                        ReturnDest::IndirectOperand(tmp, index)
+                    } else if is_intrinsic {
+                        // Currently, intrinsics always need a location to store
+                        // the result. so we create a temporary alloca for the
+                        // result
+                        let tmp = bcx.with_block(|bcx| {
+                            base::alloc_ty(bcx, ret_ty, "tmp_ret")
+                        });
+                        ReturnDest::IndirectOperand(tmp, index)
+                    } else {
+                        ReturnDest::DirectOperand(index)
+                    };
+                }
+                LocalRef::Operand(Some(_)) => {
+                    bug!("lvalue local already assigned to");
                 }
             }
-            _ => self.trans_lvalue(bcx, dest)
+        } else {
+            self.trans_lvalue(bcx, dest)
         };
         if fn_ret_ty.is_indirect() {
             llargs.push(dest.llval);
@@ -844,6 +891,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         self.store_operand(bcx, cast_ptr, val);
     }
 
+
     // Stores the return value of a function call into it's final location.
     fn store_return(&mut self,
                     bcx: &BlockAndBuilder<'bcx, 'tcx>,
@@ -852,77 +900,27 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                     op: OperandRef<'tcx>) {
         use self::ReturnDest::*;
 
-        // Handle the simple cases that don't require casts, first.
-        let llcast_ty = match dest {
-            Nothing => return,
-            Store(dst) => {
-                if let Some(llcast_ty) = ret_ty.cast {
-                    llcast_ty
-                } else {
-                    ret_ty.store(bcx, op.immediate(), dst);
-                    return;
-                }
-            }
-            IndirectOperand(tmp, idx) => {
-                let op = self.trans_load(bcx, tmp, op.ty);
-                self.temps[idx as usize] = TempRef::Operand(Some(op));
-                return;
-            }
-            DirectOperand(idx) => {
-                if let Some(llcast_ty) = ret_ty.cast {
-                    llcast_ty
-                } else {
-                    let op = op.unpack_if_pair(bcx);
-                    self.temps[idx as usize] = TempRef::Operand(Some(op));
-                    return;
-                }
-            }
-        };
-
-        // The actual return type is a struct, but the ABI
-        // adaptation code has cast it into some scalar type.  The
-        // code that follows is the only reliable way I have
-        // found to do a transform like i64 -> {i32,i32}.
-        // Basically we dump the data onto the stack then memcpy it.
-        //
-        // Other approaches I tried:
-        // - Casting rust ret pointer to the foreign type and using Store
-        //   is (a) unsafe if size of foreign type > size of rust type and
-        //   (b) runs afoul of strict aliasing rules, yielding invalid
-        //   assembly under -O (specifically, the store gets removed).
-        // - Truncating foreign type to correct integral type and then
-        //   bitcasting to the struct type yields invalid cast errors.
-
-        // We instead thus allocate some scratch space...
-        let llscratch = bcx.with_block(|bcx| {
-            let alloca = base::alloca(bcx, llcast_ty, "fn_ret_cast");
-            base::call_lifetime_start(bcx, alloca);
-            alloca
-        });
-
-        // ...where we first store the value...
-        bcx.store(op.immediate(), llscratch);
-
-        let ccx = bcx.ccx();
         match dest {
-            Store(dst) => {
-                // ...and then memcpy it to the intended destination.
-                base::call_memcpy(bcx,
-                                  bcx.pointercast(dst, Type::i8p(ccx)),
-                                  bcx.pointercast(llscratch, Type::i8p(ccx)),
-                                  C_uint(ccx, llsize_of_store(ccx, ret_ty.original_ty)),
-                                  cmp::min(llalign_of_min(ccx, ret_ty.original_ty),
-                                           llalign_of_min(ccx, llcast_ty)) as u32);
+            Nothing => (),
+            Store(dst) => ret_ty.store(bcx, op.immediate(), dst),
+            IndirectOperand(tmp, index) => {
+                let op = self.trans_load(bcx, tmp, op.ty);
+                self.locals[index] = LocalRef::Operand(Some(op));
             }
-            DirectOperand(idx) => {
-                let llptr = bcx.pointercast(llscratch, ret_ty.original_ty.ptr_to());
-                let op = self.trans_load(bcx, llptr, op.ty);
-                self.temps[idx as usize] = TempRef::Operand(Some(op));
+            DirectOperand(index) => {
+                // If there is a cast, we have to store and reload.
+                let op = if ret_ty.cast.is_some() {
+                    let tmp = bcx.with_block(|bcx| {
+                        base::alloc_ty(bcx, op.ty, "tmp_ret")
+                    });
+                    ret_ty.store(bcx, op.immediate(), tmp);
+                    self.trans_load(bcx, tmp, op.ty)
+                } else {
+                    op.unpack_if_pair(bcx)
+                };
+                self.locals[index] = LocalRef::Operand(Some(op));
             }
-            Nothing | IndirectOperand(_, _) => bug!()
         }
-
-        bcx.with_block(|bcx| base::call_lifetime_end(bcx, llscratch));
     }
 }
 
@@ -931,8 +929,8 @@ enum ReturnDest {
     Nothing,
     // Store the return value to the pointer
     Store(ValueRef),
-    // Stores an indirect return value to an operand temporary lvalue
-    IndirectOperand(ValueRef, u32),
-    // Stores a direct return value to an operand temporary lvalue
-    DirectOperand(u32)
+    // Stores an indirect return value to an operand local lvalue
+    IndirectOperand(ValueRef, mir::Local),
+    // Stores a direct return value to an operand local lvalue
+    DirectOperand(mir::Local)
 }

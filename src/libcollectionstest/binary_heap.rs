@@ -9,6 +9,7 @@
 // except according to those terms.
 
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::Drain;
 
 #[test]
 fn test_iterator() {
@@ -79,6 +80,18 @@ fn test_peek_and_pop() {
         assert_eq!(heap.peek().unwrap(), sorted.last().unwrap());
         assert_eq!(heap.pop().unwrap(), sorted.pop().unwrap());
     }
+}
+
+#[test]
+fn test_peek_mut() {
+    let data = vec![2, 4, 6, 2, 1, 8, 10, 3, 5, 7, 0, 9, 1];
+    let mut heap = BinaryHeap::from(data);
+    assert_eq!(heap.peek(), Some(&10));
+    {
+        let mut top = heap.peek_mut().unwrap();
+        *top -= 2;
+    }
+    assert_eq!(heap.peek(), Some(&9));
 }
 
 #[test]
@@ -193,6 +206,12 @@ fn test_empty_peek() {
 }
 
 #[test]
+fn test_empty_peek_mut() {
+    let mut empty = BinaryHeap::<i32>::new();
+    assert!(empty.peek_mut().is_none());
+}
+
+#[test]
 fn test_empty_replace() {
     let mut heap = BinaryHeap::new();
     assert!(heap.replace(5).is_none());
@@ -273,4 +292,9 @@ fn test_extend_specialization() {
     a.extend(b);
 
     assert_eq!(a.into_sorted_vec(), [-20, -10, 1, 2, 3, 3, 5, 43]);
+}
+
+#[allow(dead_code)]
+fn assert_covariance() {
+    fn drain<'new>(d: Drain<'static, &'static str>) -> Drain<'new, &'new str> { d }
 }

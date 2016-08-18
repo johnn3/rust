@@ -19,9 +19,9 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 
 use syntax::ast;
 use syntax::attr::{self, AttrMetaMethods};
-use syntax::codemap::Span;
 use syntax::feature_gate::{KNOWN_ATTRIBUTES, AttributeType};
 use syntax::ptr::P;
+use syntax_pos::Span;
 
 use rustc_back::slice;
 use rustc::hir;
@@ -133,6 +133,7 @@ impl LateLintPass for UnusedResults {
         let t = cx.tcx.expr_ty(&expr);
         let warned = match t.sty {
             ty::TyTuple(ref tys) if tys.is_empty() => return,
+            ty::TyNever => return,
             ty::TyBool => return,
             ty::TyStruct(def, _) |
             ty::TyEnum(def, _) => {
@@ -150,12 +151,9 @@ impl LateLintPass for UnusedResults {
                 if attr.check_name("must_use") {
                     let mut msg = "unused result which must be used".to_string();
                     // check for #[must_use="..."]
-                    match attr.value_str() {
-                        None => {}
-                        Some(s) => {
-                            msg.push_str(": ");
-                            msg.push_str(&s);
-                        }
+                    if let Some(s) = attr.value_str() {
+                        msg.push_str(": ");
+                        msg.push_str(&s);
                     }
                     cx.span_lint(UNUSED_MUST_USE, sp, &msg);
                     return true;
@@ -365,12 +363,9 @@ impl EarlyLintPass for UnusedParens {
 
     fn check_stmt(&mut self, cx: &EarlyContext, s: &ast::Stmt) {
         let (value, msg) = match s.node {
-            ast::StmtKind::Decl(ref decl, _) => match decl.node {
-                ast::DeclKind::Local(ref local) => match local.init {
-                    Some(ref value) => (value, "assigned value"),
-                    None => return
-                },
-                _ => return
+            ast::StmtKind::Local(ref local) => match local.init {
+                Some(ref value) => (value, "assigned value"),
+                None => return
             },
             _ => return
         };

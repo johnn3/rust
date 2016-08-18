@@ -14,17 +14,19 @@
 #![feature(plugin_registrar, quote, rustc_private)]
 
 extern crate syntax;
+extern crate syntax_pos;
 extern crate rustc;
 extern crate rustc_plugin;
 
-use syntax::codemap::Span;
 use syntax::parse::token::{self, str_to_ident, NtExpr, NtPat};
-use syntax::ast::{TokenTree, Pat};
+use syntax::ast::{Pat};
+use syntax::tokenstream::{TokenTree};
 use syntax::ext::base::{ExtCtxt, MacResult, DummyResult, MacEager};
 use syntax::ext::build::AstBuilder;
 use syntax::ext::tt::macro_parser::{MatchedSeq, MatchedNonterminal};
 use syntax::ext::tt::macro_parser::{Success, Failure, Error};
 use syntax::ptr::P;
+use syntax_pos::Span;
 use rustc_plugin::Registry;
 
 fn expand_mbe_matches(cx: &mut ExtCtxt, sp: Span, args: &[TokenTree])
@@ -34,7 +36,7 @@ fn expand_mbe_matches(cx: &mut ExtCtxt, sp: Span, args: &[TokenTree])
 
     let mac_expr = match TokenTree::parse(cx, &mbe_matcher[..], args) {
         Success(map) => {
-            match (&*map[&str_to_ident("matched").name], &*map[&str_to_ident("pat").name]) {
+            match (&*map[&str_to_ident("matched")], &*map[&str_to_ident("pat")]) {
                 (&MatchedNonterminal(NtExpr(ref matched_expr)),
                  &MatchedSeq(ref pats, seq_sp)) => {
                     let pats: Vec<P<Pat>> = pats.iter().map(|pat_nt|

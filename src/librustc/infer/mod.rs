@@ -25,23 +25,20 @@ use middle::mem_categorization as mc;
 use middle::mem_categorization::McResult;
 use middle::region::CodeExtent;
 use mir::tcx::LvalueTy;
-use ty::subst;
-use ty::subst::Substs;
-use ty::subst::Subst;
+use ty::subst::{Subst, Substs};
 use ty::adjustment;
 use ty::{TyVid, IntVid, FloatVid};
 use ty::{self, Ty, TyCtxt};
 use ty::error::{ExpectedFound, TypeError, UnconstrainedNumeric};
-use ty::fold::TypeFoldable;
+use ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
 use ty::relate::{Relate, RelateResult, TypeRelation};
-use traits::{self, PredicateObligations, ProjectionMode};
+use traits::{self, PredicateObligations, Reveal};
 use rustc_data_structures::unify::{self, UnificationTable};
 use std::cell::{Cell, RefCell, Ref, RefMut};
 use std::fmt;
 use syntax::ast;
-use syntax::codemap;
-use syntax::codemap::{Span, DUMMY_SP};
-use syntax::errors::DiagnosticBuilder;
+use errors::DiagnosticBuilder;
+use syntax_pos::{self, Span, DUMMY_SP};
 use util::nodemap::{FnvHashMap, FnvHashSet, NodeMap};
 
 use self::combine::CombineFields;
@@ -49,18 +46,18 @@ use self::higher_ranked::HrMatchResult;
 use self::region_inference::{RegionVarBindings, RegionSnapshot};
 use self::unify_key::ToType;
 
-pub mod bivariate;
-pub mod combine;
-pub mod equate;
+mod bivariate;
+mod combine;
+mod equate;
 pub mod error_reporting;
-pub mod glb;
+mod glb;
 mod higher_ranked;
 pub mod lattice;
-pub mod lub;
+mod lub;
 pub mod region_inference;
 pub mod resolve;
 mod freshen;
-pub mod sub;
+mod sub;
 pub mod type_variable;
 pub mod unify_key;
 
@@ -148,8 +145,8 @@ pub struct InferCtxt<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
 
     // Sadly, the behavior of projection varies a bit depending on the
     // stage of compilation. The specifics are given in the
-    // documentation for `ProjectionMode`.
-    projection_mode: ProjectionMode,
+    // documentation for `Reveal`.
+    projection_mode: Reveal,
 
     // When an error occurs, we want to avoid reporting "derived"
     // errors that are due to this original failure. Normally, we
@@ -197,12 +194,6 @@ pub enum TypeOrigin {
     // FIXME(eddyb) #11161 is the original Expr required?
     ExprAssignable(Span),
 
-    // Relating trait refs when resolving vtables
-    RelateTraitRefs(Span),
-
-    // Relating self types when resolving vtables
-    RelateSelfType(Span),
-
     // Relating trait type parameters to those found in impl etc
     RelateOutputImplTypes(Span),
 
@@ -220,16 +211,26 @@ pub enum TypeOrigin {
 
     // `where a == b`
     EquatePredicate(Span),
+
+    // `main` has wrong type
+    MainFunctionType(Span),
+
+    // `start` has wrong type
+    StartFunctionType(Span),
+
+    // intrinsic has wrong type
+    IntrinsicType(Span),
+
+    // method receiver
+    MethodReceiver(Span),
 }
 
 impl TypeOrigin {
-    fn as_str(&self) -> &'static str {
+    fn as_failure_str(&self) -> &'static str {
         match self {
             &TypeOrigin::Misc(_) |
-            &TypeOrigin::RelateSelfType(_) |
             &TypeOrigin::RelateOutputImplTypes(_) |
             &TypeOrigin::ExprAssignable(_) => "mismatched types",
-            &TypeOrigin::RelateTraitRefs(_) => "mismatched traits",
             &TypeOrigin::MethodCompatCheck(_) => "method not compatible with trait",
             &TypeOrigin::MatchExpressionArm(_, _, source) => match source {
                 hir::MatchSource::IfLetDesugar{..} => "`if let` arms have incompatible types",
@@ -239,13 +240,31 @@ impl TypeOrigin {
             &TypeOrigin::IfExpressionWithNoElse(_) => "if may be missing an else clause",
             &TypeOrigin::RangeExpression(_) => "start and end of range have incompatible types",
             &TypeOrigin::EquatePredicate(_) => "equality predicate not satisfied",
+            &TypeOrigin::MainFunctionType(_) => "main function has wrong type",
+            &TypeOrigin::StartFunctionType(_) => "start function has wrong type",
+            &TypeOrigin::IntrinsicType(_) => "intrinsic has wrong type",
+            &TypeOrigin::MethodReceiver(_) => "mismatched method receiver",
         }
     }
-}
 
-impl fmt::Display for TypeOrigin {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(),fmt::Error> {
-        fmt::Display::fmt(self.as_str(), f)
+    fn as_requirement_str(&self) -> &'static str {
+        match self {
+            &TypeOrigin::Misc(_) => "types are compatible",
+            &TypeOrigin::MethodCompatCheck(_) => "method type is compatible with trait",
+            &TypeOrigin::ExprAssignable(_) => "expression is assignable",
+            &TypeOrigin::RelateOutputImplTypes(_) => {
+                "trait type parameters matches those specified on the impl"
+            }
+            &TypeOrigin::MatchExpressionArm(_, _, _) => "match arms have compatible types",
+            &TypeOrigin::IfExpression(_) => "if and else have compatible types",
+            &TypeOrigin::IfExpressionWithNoElse(_) => "if missing an else returns ()",
+            &TypeOrigin::RangeExpression(_) => "start and end of range have compatible types",
+            &TypeOrigin::EquatePredicate(_) => "equality where clause is satisfied",
+            &TypeOrigin::MainFunctionType(_) => "`main` function has the correct type",
+            &TypeOrigin::StartFunctionType(_) => "`start` function has the correct type",
+            &TypeOrigin::IntrinsicType(_) => "intrinsic has the correct type",
+            &TypeOrigin::MethodReceiver(_) => "method receiver has the correct type",
+        }
     }
 }
 
@@ -438,7 +457,7 @@ pub struct InferCtxtBuilder<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     arenas: ty::CtxtArenas<'tcx>,
     tables: Option<RefCell<ty::Tables<'tcx>>>,
     param_env: Option<ty::ParameterEnvironment<'gcx>>,
-    projection_mode: ProjectionMode,
+    projection_mode: Reveal,
     normalize: bool
 }
 
@@ -446,7 +465,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'gcx> {
     pub fn infer_ctxt(self,
                       tables: Option<ty::Tables<'tcx>>,
                       param_env: Option<ty::ParameterEnvironment<'gcx>>,
-                      projection_mode: ProjectionMode)
+                      projection_mode: Reveal)
                       -> InferCtxtBuilder<'a, 'gcx, 'tcx> {
         InferCtxtBuilder {
             global_tcx: self,
@@ -458,7 +477,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'gcx> {
         }
     }
 
-    pub fn normalizing_infer_ctxt(self, projection_mode: ProjectionMode)
+    pub fn normalizing_infer_ctxt(self, projection_mode: Reveal)
                                   -> InferCtxtBuilder<'a, 'gcx, 'tcx> {
         InferCtxtBuilder {
             global_tcx: self,
@@ -488,7 +507,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'gcx> {
             projection_cache: RefCell::new(traits::ProjectionCache::new()),
             reported_trait_errors: RefCell::new(FnvHashSet()),
             normalize: false,
-            projection_mode: ProjectionMode::AnyFinal,
+            projection_mode: Reveal::NotSpecializable,
             tainted_by_errors_flag: Cell::new(false),
             err_count_on_creation: self.sess.err_count(),
             obligations_in_snapshot: Cell::new(false),
@@ -586,7 +605,6 @@ impl_trans_normalize!('gcx,
     Ty<'gcx>,
     &'gcx Substs<'gcx>,
     ty::FnSig<'gcx>,
-    ty::FnOutput<'gcx>,
     &'gcx ty::BareFnTy<'gcx>,
     ty::ClosureSubsts<'gcx>,
     ty::PolyTraitRef<'gcx>
@@ -620,7 +638,7 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
             return value;
         }
 
-        self.infer_ctxt(None, None, ProjectionMode::Any).enter(|infcx| {
+        self.infer_ctxt(None, None, Reveal::All).enter(|infcx| {
             value.trans_normalize(&infcx)
         })
     }
@@ -638,7 +656,7 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
             return value;
         }
 
-        self.infer_ctxt(None, Some(env.clone()), ProjectionMode::Any).enter(|infcx| {
+        self.infer_ctxt(None, Some(env.clone()), Reveal::All).enter(|infcx| {
             value.trans_normalize(&infcx)
        })
     }
@@ -715,7 +733,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         Ok(self.tcx.erase_regions(&result))
     }
 
-    pub fn projection_mode(&self) -> ProjectionMode {
+    pub fn projection_mode(&self) -> Reveal {
         self.projection_mode
     }
 
@@ -800,11 +818,10 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         return variables;
     }
 
-    fn combine_fields(&'a self, a_is_expected: bool, trace: TypeTrace<'tcx>)
+    fn combine_fields(&'a self, trace: TypeTrace<'tcx>)
                       -> CombineFields<'a, 'gcx, 'tcx> {
         CombineFields {
             infcx: self,
-            a_is_expected: a_is_expected,
             trace: trace,
             cause: None,
             obligations: PredicateObligations::new(),
@@ -815,36 +832,36 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         -> InferResult<'tcx, T>
         where T: Relate<'tcx>
     {
-        let mut equate = self.combine_fields(a_is_expected, trace).equate();
-        let result = equate.relate(a, b);
-        result.map(|t| InferOk { value: t, obligations: equate.obligations() })
+        let mut fields = self.combine_fields(trace);
+        let result = fields.equate(a_is_expected).relate(a, b);
+        result.map(move |t| InferOk { value: t, obligations: fields.obligations })
     }
 
     pub fn sub<T>(&'a self, a_is_expected: bool, trace: TypeTrace<'tcx>, a: &T, b: &T)
         -> InferResult<'tcx, T>
         where T: Relate<'tcx>
     {
-        let mut sub = self.combine_fields(a_is_expected, trace).sub();
-        let result = sub.relate(a, b);
-        result.map(|t| InferOk { value: t, obligations: sub.obligations() })
+        let mut fields = self.combine_fields(trace);
+        let result = fields.sub(a_is_expected).relate(a, b);
+        result.map(move |t| InferOk { value: t, obligations: fields.obligations })
     }
 
     pub fn lub<T>(&'a self, a_is_expected: bool, trace: TypeTrace<'tcx>, a: &T, b: &T)
         -> InferResult<'tcx, T>
         where T: Relate<'tcx>
     {
-        let mut lub = self.combine_fields(a_is_expected, trace).lub();
-        let result = lub.relate(a, b);
-        result.map(|t| InferOk { value: t, obligations: lub.obligations() })
+        let mut fields = self.combine_fields(trace);
+        let result = fields.lub(a_is_expected).relate(a, b);
+        result.map(move |t| InferOk { value: t, obligations: fields.obligations })
     }
 
     pub fn glb<T>(&'a self, a_is_expected: bool, trace: TypeTrace<'tcx>, a: &T, b: &T)
         -> InferResult<'tcx, T>
         where T: Relate<'tcx>
     {
-        let mut glb = self.combine_fields(a_is_expected, trace).glb();
-        let result = glb.relate(a, b);
-        result.map(|t| InferOk { value: t, obligations: glb.obligations() })
+        let mut fields = self.combine_fields(trace);
+        let result = fields.glb(a_is_expected).relate(a, b);
+        result.map(move |t| InferOk { value: t, obligations: fields.obligations })
     }
 
     fn start_snapshot(&self) -> CombinedSnapshot {
@@ -1036,7 +1053,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                          -> UnitResult<'tcx>
     {
         self.probe(|_| {
-            let origin = TypeOrigin::Misc(codemap::DUMMY_SP);
+            let origin = TypeOrigin::Misc(syntax_pos::DUMMY_SP);
             let trace = TypeTrace::types(origin, true, a, b);
             self.sub(true, trace, &a, &b).map(|_| ())
         })
@@ -1153,15 +1170,6 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         self.tcx.mk_var(self.next_ty_var_id(false))
     }
 
-    pub fn next_ty_var_with_default(&self,
-                                    default: Option<type_variable::Default<'tcx>>) -> Ty<'tcx> {
-        let ty_var_id = self.type_variables
-                            .borrow_mut()
-                            .new_var(false, default);
-
-        self.tcx.mk_var(ty_var_id)
-    }
-
     pub fn next_diverging_ty_var(&self) -> Ty<'tcx> {
         self.tcx.mk_var(self.next_ty_var_id(true))
     }
@@ -1186,89 +1194,55 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         ty::ReVar(self.region_vars.new_region_var(origin))
     }
 
-    pub fn region_vars_for_defs(&self,
-                                span: Span,
-                                defs: &[ty::RegionParameterDef])
-                                -> Vec<ty::Region> {
-        defs.iter()
-            .map(|d| self.next_region_var(EarlyBoundRegion(span, d.name)))
-            .collect()
+    /// Create a region inference variable for the given
+    /// region parameter definition.
+    pub fn region_var_for_def(&self,
+                              span: Span,
+                              def: &ty::RegionParameterDef)
+                              -> ty::Region {
+        self.next_region_var(EarlyBoundRegion(span, def.name))
     }
 
-    // We have to take `&mut Substs` in order to provide the correct substitutions for defaults
-    // along the way, for this reason we don't return them.
-    pub fn type_vars_for_defs(&self,
-                              span: Span,
-                              space: subst::ParamSpace,
-                              substs: &mut Substs<'tcx>,
-                              defs: &[ty::TypeParameterDef<'tcx>]) {
+    /// Create a type inference variable for the given
+    /// type parameter definition. The substitutions are
+    /// for actual parameters that may be referred to by
+    /// the default of this type parameter, if it exists.
+    /// E.g. `struct Foo<A, B, C = (A, B)>(...);` when
+    /// used in a path such as `Foo::<T, U>::new()` will
+    /// use an inference variable for `C` with `[T, U]`
+    /// as the substitutions for the default, `(T, U)`.
+    pub fn type_var_for_def(&self,
+                            span: Span,
+                            def: &ty::TypeParameterDef<'tcx>,
+                            substs: &Substs<'tcx>)
+                            -> Ty<'tcx> {
+        let default = def.default.map(|default| {
+            type_variable::Default {
+                ty: default.subst_spanned(self.tcx, substs, Some(span)),
+                origin_span: span,
+                def_id: def.default_def_id
+            }
+        });
 
-        for def in defs.iter() {
-            let default = def.default.map(|default| {
-                type_variable::Default {
-                    ty: default.subst_spanned(self.tcx, substs, Some(span)),
-                    origin_span: span,
-                    def_id: def.default_def_id
-                }
-            });
 
-            let ty_var = self.next_ty_var_with_default(default);
-            substs.types.push(space, ty_var);
-        }
+        let ty_var_id = self.type_variables
+                            .borrow_mut()
+                            .new_var(false, default);
+
+        self.tcx.mk_var(ty_var_id)
     }
 
     /// Given a set of generics defined on a type or impl, returns a substitution mapping each
     /// type/region parameter to a fresh inference variable.
-    pub fn fresh_substs_for_generics(&self,
-                                     span: Span,
-                                     generics: &ty::Generics<'tcx>)
-                                     -> &'tcx subst::Substs<'tcx>
-    {
-        let type_params = subst::VecPerParamSpace::empty();
-
-        let region_params =
-            generics.regions.map(
-                |d| self.next_region_var(EarlyBoundRegion(span, d.name)));
-
-        let mut substs = subst::Substs::new(type_params, region_params);
-
-        for space in subst::ParamSpace::all().iter() {
-            self.type_vars_for_defs(
-                span,
-                *space,
-                &mut substs,
-                generics.types.get_slice(*space));
-        }
-
-        self.tcx.mk_substs(substs)
-    }
-
-    /// Given a set of generics defined on a trait, returns a substitution mapping each output
-    /// type/region parameter to a fresh inference variable, and mapping the self type to
-    /// `self_ty`.
-    pub fn fresh_substs_for_trait(&self,
-                                  span: Span,
-                                  generics: &ty::Generics<'tcx>,
-                                  self_ty: Ty<'tcx>)
-                                  -> subst::Substs<'tcx>
-    {
-
-        assert!(generics.types.len(subst::SelfSpace) == 1);
-        assert!(generics.types.len(subst::FnSpace) == 0);
-        assert!(generics.regions.len(subst::SelfSpace) == 0);
-        assert!(generics.regions.len(subst::FnSpace) == 0);
-
-        let type_params = Vec::new();
-
-        let region_param_defs = generics.regions.get_slice(subst::TypeSpace);
-        let regions = self.region_vars_for_defs(span, region_param_defs);
-
-        let mut substs = subst::Substs::new_trait(type_params, regions, self_ty);
-
-        let type_parameter_defs = generics.types.get_slice(subst::TypeSpace);
-        self.type_vars_for_defs(span, subst::TypeSpace, &mut substs, type_parameter_defs);
-
-        return substs;
+    pub fn fresh_substs_for_item(&self,
+                                 span: Span,
+                                 def_id: DefId)
+                                 -> &'tcx Substs<'tcx> {
+        Substs::for_item(self.tcx, def_id, |def, _| {
+            self.region_var_for_def(span, def)
+        }, |def, substs| {
+            self.type_var_for_def(span, def, substs)
+        })
     }
 
     pub fn fresh_bound_region(&self, debruijn: ty::DebruijnIndex) -> ty::Region {
@@ -1469,104 +1443,50 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     // error type, meaning that an error occurred when typechecking this expression),
     // this is a derived error. The error cascaded from another error (that was already
     // reported), so it's not useful to display it to the user.
-    // The following four methods -- type_error_message_str, type_error_message_str_with_expected,
-    // type_error_message, and report_mismatched_types -- implement this logic.
+    // The following methods implement this logic.
     // They check if either the actual or expected type is TyError, and don't print the error
     // in this case. The typechecker should only ever report type errors involving mismatched
-    // types using one of these four methods, and should not call span_err directly for such
+    // types using one of these methods, and should not call span_err directly for such
     // errors.
-    pub fn type_error_message_str<M>(&self,
-                                     sp: Span,
-                                     mk_msg: M,
-                                     actual_ty: String,
-                                     err: Option<&TypeError<'tcx>>)
-        where M: FnOnce(Option<String>, String) -> String,
-    {
-        self.type_error_message_str_with_expected(sp, mk_msg, None, actual_ty, err)
-    }
-
-    pub fn type_error_struct_str<M>(&self,
-                                    sp: Span,
-                                    mk_msg: M,
-                                    actual_ty: String,
-                                    err: Option<&TypeError<'tcx>>)
-                                    -> DiagnosticBuilder<'tcx>
-        where M: FnOnce(Option<String>, String) -> String,
-    {
-        self.type_error_struct_str_with_expected(sp, mk_msg, None, actual_ty, err)
-    }
-
-    pub fn type_error_message_str_with_expected<M>(&self,
-                                                   sp: Span,
-                                                   mk_msg: M,
-                                                   expected_ty: Option<Ty<'tcx>>,
-                                                   actual_ty: String,
-                                                   err: Option<&TypeError<'tcx>>)
-        where M: FnOnce(Option<String>, String) -> String,
-    {
-        self.type_error_struct_str_with_expected(sp, mk_msg, expected_ty, actual_ty, err)
-            .emit();
-    }
-
-    pub fn type_error_struct_str_with_expected<M>(&self,
-                                                  sp: Span,
-                                                  mk_msg: M,
-                                                  expected_ty: Option<Ty<'tcx>>,
-                                                  actual_ty: String,
-                                                  err: Option<&TypeError<'tcx>>)
-                                                  -> DiagnosticBuilder<'tcx>
-        where M: FnOnce(Option<String>, String) -> String,
-    {
-        debug!("hi! expected_ty = {:?}, actual_ty = {}", expected_ty, actual_ty);
-
-        let resolved_expected = expected_ty.map(|e_ty| self.resolve_type_vars_if_possible(&e_ty));
-
-        if !resolved_expected.references_error() {
-            let error_str = err.map_or("".to_string(), |t_err| {
-                format!(" ({})", t_err)
-            });
-
-            let mut db = self.tcx.sess.struct_span_err(sp, &format!("{}{}",
-                mk_msg(resolved_expected.map(|t| self.ty_to_string(t)), actual_ty),
-                error_str));
-
-            if let Some(err) = err {
-                self.tcx.note_and_explain_type_err(&mut db, err, sp);
-            }
-            db
-        } else {
-            self.tcx.sess.diagnostic().struct_dummy()
-        }
-    }
 
     pub fn type_error_message<M>(&self,
                                  sp: Span,
                                  mk_msg: M,
-                                 actual_ty: Ty<'tcx>,
-                                 err: Option<&TypeError<'tcx>>)
+                                 actual_ty: Ty<'tcx>)
         where M: FnOnce(String) -> String,
     {
-        self.type_error_struct(sp, mk_msg, actual_ty, err).emit();
+        self.type_error_struct(sp, mk_msg, actual_ty).emit();
     }
 
+    // FIXME: this results in errors without an error code. Deprecate?
     pub fn type_error_struct<M>(&self,
                                 sp: Span,
                                 mk_msg: M,
-                                actual_ty: Ty<'tcx>,
-                                err: Option<&TypeError<'tcx>>)
+                                actual_ty: Ty<'tcx>)
                                 -> DiagnosticBuilder<'tcx>
         where M: FnOnce(String) -> String,
     {
+        self.type_error_struct_with_diag(sp, |actual_ty| {
+            self.tcx.sess.struct_span_err(sp, &mk_msg(actual_ty))
+        }, actual_ty)
+    }
+
+    pub fn type_error_struct_with_diag<M>(&self,
+                                          sp: Span,
+                                          mk_diag: M,
+                                          actual_ty: Ty<'tcx>)
+                                          -> DiagnosticBuilder<'tcx>
+        where M: FnOnce(String) -> DiagnosticBuilder<'tcx>,
+    {
         let actual_ty = self.resolve_type_vars_if_possible(&actual_ty);
+        debug!("type_error_struct_with_diag({:?}, {:?})", sp, actual_ty);
 
         // Don't report an error if actual type is TyError.
         if actual_ty.references_error() {
             return self.tcx.sess.diagnostic().struct_dummy();
         }
 
-        self.type_error_struct_str(sp,
-            move |_e, a| { mk_msg(a) },
-            self.ty_to_string(actual_ty), err)
+        mk_diag(self.ty_to_string(actual_ty))
     }
 
     pub fn report_mismatched_types(&self,
@@ -1647,8 +1567,8 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         };
 
         let match_pair = match_a.map_bound(|p| (p.projection_ty.trait_ref, p.ty));
-        let combine = self.combine_fields(true, trace);
-        let result = combine.higher_ranked_match(span, &match_pair, &match_b)?;
+        let mut combine = self.combine_fields(trace);
+        let result = combine.higher_ranked_match(span, &match_pair, &match_b, true)?;
         Ok(InferOk { value: result, obligations: combine.obligations })
     }
 
@@ -1813,7 +1733,7 @@ impl<'a, 'gcx, 'tcx> TypeTrace<'tcx> {
 
     pub fn dummy(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> TypeTrace<'tcx> {
         TypeTrace {
-            origin: TypeOrigin::Misc(codemap::DUMMY_SP),
+            origin: TypeOrigin::Misc(syntax_pos::DUMMY_SP),
             values: Types(ExpectedFound {
                 expected: tcx.types.err,
                 found: tcx.types.err,
@@ -1834,14 +1754,16 @@ impl TypeOrigin {
             TypeOrigin::MethodCompatCheck(span) => span,
             TypeOrigin::ExprAssignable(span) => span,
             TypeOrigin::Misc(span) => span,
-            TypeOrigin::RelateTraitRefs(span) => span,
-            TypeOrigin::RelateSelfType(span) => span,
             TypeOrigin::RelateOutputImplTypes(span) => span,
             TypeOrigin::MatchExpressionArm(match_span, _, _) => match_span,
             TypeOrigin::IfExpression(span) => span,
             TypeOrigin::IfExpressionWithNoElse(span) => span,
             TypeOrigin::RangeExpression(span) => span,
             TypeOrigin::EquatePredicate(span) => span,
+            TypeOrigin::MainFunctionType(span) => span,
+            TypeOrigin::StartFunctionType(span) => span,
+            TypeOrigin::IntrinsicType(span) => span,
+            TypeOrigin::MethodReceiver(span) => span,
         }
     }
 }
@@ -1887,8 +1809,55 @@ impl RegionVariableOrigin {
             Coercion(a) => a,
             EarlyBoundRegion(a, _) => a,
             LateBoundRegion(a, _, _) => a,
-            BoundRegionInCoherence(_) => codemap::DUMMY_SP,
+            BoundRegionInCoherence(_) => syntax_pos::DUMMY_SP,
             UpvarRegion(_, a) => a
         }
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for TypeOrigin {
+    fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, _folder: &mut F) -> Self {
+        self.clone()
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, _visitor: &mut V) -> bool {
+        false
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for ValuePairs<'tcx> {
+    fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
+        match *self {
+            ValuePairs::Types(ref ef) => {
+                ValuePairs::Types(ef.fold_with(folder))
+            }
+            ValuePairs::TraitRefs(ref ef) => {
+                ValuePairs::TraitRefs(ef.fold_with(folder))
+            }
+            ValuePairs::PolyTraitRefs(ref ef) => {
+                ValuePairs::PolyTraitRefs(ef.fold_with(folder))
+            }
+        }
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> bool {
+        match *self {
+            ValuePairs::Types(ref ef) => ef.visit_with(visitor),
+            ValuePairs::TraitRefs(ref ef) => ef.visit_with(visitor),
+            ValuePairs::PolyTraitRefs(ref ef) => ef.visit_with(visitor),
+        }
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for TypeTrace<'tcx> {
+    fn super_fold_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(&self, folder: &mut F) -> Self {
+        TypeTrace {
+            origin: self.origin.fold_with(folder),
+            values: self.values.fold_with(folder)
+        }
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> bool {
+        self.origin.visit_with(visitor) || self.values.visit_with(visitor)
     }
 }

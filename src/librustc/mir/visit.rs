@@ -11,11 +11,12 @@
 use middle::const_val::ConstVal;
 use hir::def_id::DefId;
 use ty::subst::Substs;
-use ty::{ClosureSubsts, FnOutput, Region, Ty};
+use ty::{ClosureSubsts, Region, Ty};
 use mir::repr::*;
 use rustc_const_math::ConstUsize;
 use rustc_data_structures::tuple_slice::TupleSlice;
-use syntax::codemap::Span;
+use rustc_data_structures::indexed_vec::Idx;
+use syntax_pos::Span;
 
 // # The MIR Visitor
 //
@@ -37,9 +38,7 @@ use syntax::codemap::Span;
 //
 // For the most part, we do not destructure things external to the
 // MIR, e.g. types, spans, etc, but simply visit them and stop. This
-// avoids duplication with other visitors like `TypeFoldable`. But
-// there is one exception: we do destructure the `FnOutput` to reach
-// the type within. Just because.
+// avoids duplication with other visitors like `TypeFoldable`.
 //
 // ## Updating
 //
@@ -97,9 +96,9 @@ macro_rules! make_mir_visitor {
                 self.super_basic_block_data(block, data);
             }
 
-            fn visit_scope_data(&mut self,
-                                scope_data: & $($mutability)* ScopeData) {
-                self.super_scope_data(scope_data);
+            fn visit_visibility_scope_data(&mut self,
+                                           scope_data: & $($mutability)* VisibilityScopeData) {
+                self.super_visibility_scope_data(scope_data);
             }
 
             fn visit_statement(&mut self,
@@ -186,9 +185,9 @@ macro_rules! make_mir_visitor {
                 self.super_span(span);
             }
 
-            fn visit_fn_output(&mut self,
-                               fn_output: & $($mutability)* FnOutput<'tcx>) {
-                self.super_fn_output(fn_output);
+            fn visit_source_info(&mut self,
+                                 source_info: & $($mutability)* SourceInfo) {
+                self.super_source_info(source_info);
             }
 
             fn visit_ty(&mut self,
@@ -236,9 +235,9 @@ macro_rules! make_mir_visitor {
                 self.super_arg_decl(arg_decl);
             }
 
-            fn visit_scope_id(&mut self,
-                              scope_id: & $($mutability)* ScopeId) {
-                self.super_scope_id(scope_id);
+            fn visit_visibility_scope(&mut self,
+                                      scope: & $($mutability)* VisibilityScope) {
+                self.super_visibility_scope(scope);
             }
 
             // The `super_xxx` methods comprise the default behavior and are
@@ -246,42 +245,30 @@ macro_rules! make_mir_visitor {
 
             fn super_mir(&mut self,
                          mir: & $($mutability)* Mir<'tcx>) {
-                let Mir {
-                    ref $($mutability)* basic_blocks,
-                    ref $($mutability)* scopes,
-                    promoted: _, // Visited by passes separately.
-                    ref $($mutability)* return_ty,
-                    ref $($mutability)* var_decls,
-                    ref $($mutability)* arg_decls,
-                    ref $($mutability)* temp_decls,
-                    upvar_decls: _,
-                    ref $($mutability)* span,
-                } = *mir;
-
-                for (index, data) in basic_blocks.into_iter().enumerate() {
+                for index in 0..mir.basic_blocks().len() {
                     let block = BasicBlock::new(index);
-                    self.visit_basic_block_data(block, data);
+                    self.visit_basic_block_data(block, &$($mutability)* mir[block]);
                 }
 
-                for scope in scopes {
-                    self.visit_scope_data(scope);
+                for scope in &$($mutability)* mir.visibility_scopes {
+                    self.visit_visibility_scope_data(scope);
                 }
 
-                self.visit_fn_output(return_ty);
+                self.visit_ty(&$($mutability)* mir.return_ty);
 
-                for var_decl in var_decls {
+                for var_decl in &$($mutability)* mir.var_decls {
                     self.visit_var_decl(var_decl);
                 }
 
-                for arg_decl in arg_decls {
+                for arg_decl in &$($mutability)* mir.arg_decls {
                     self.visit_arg_decl(arg_decl);
                 }
 
-                for temp_decl in temp_decls {
+                for temp_decl in &$($mutability)* mir.temp_decls {
                     self.visit_temp_decl(temp_decl);
                 }
 
-                self.visit_span(span);
+                self.visit_span(&$($mutability)* mir.span);
             }
 
             fn super_basic_block_data(&mut self,
@@ -302,16 +289,16 @@ macro_rules! make_mir_visitor {
                 }
             }
 
-            fn super_scope_data(&mut self,
-                                scope_data: & $($mutability)* ScopeData) {
-                let ScopeData {
+            fn super_visibility_scope_data(&mut self,
+                                           scope_data: & $($mutability)* VisibilityScopeData) {
+                let VisibilityScopeData {
                     ref $($mutability)* span,
                     ref $($mutability)* parent_scope,
                 } = *scope_data;
 
                 self.visit_span(span);
                 if let Some(ref $($mutability)* parent_scope) = *parent_scope {
-                    self.visit_scope_id(parent_scope);
+                    self.visit_visibility_scope(parent_scope);
                 }
             }
 
@@ -319,17 +306,24 @@ macro_rules! make_mir_visitor {
                                block: BasicBlock,
                                statement: & $($mutability)* Statement<'tcx>) {
                 let Statement {
-                    ref $($mutability)* span,
-                    ref $($mutability)* scope,
+                    ref $($mutability)* source_info,
                     ref $($mutability)* kind,
                 } = *statement;
 
-                self.visit_span(span);
-                self.visit_scope_id(scope);
+                self.visit_source_info(source_info);
                 match *kind {
                     StatementKind::Assign(ref $($mutability)* lvalue,
                                           ref $($mutability)* rvalue) => {
                         self.visit_assign(block, lvalue, rvalue);
+                    }
+                    StatementKind::SetDiscriminant{ ref $($mutability)* lvalue, .. } => {
+                        self.visit_lvalue(lvalue, LvalueContext::Store);
+                    }
+                    StatementKind::StorageLive(ref $($mutability)* lvalue) => {
+                        self.visit_lvalue(lvalue, LvalueContext::StorageLive);
+                    }
+                    StatementKind::StorageDead(ref $($mutability)* lvalue) => {
+                        self.visit_lvalue(lvalue, LvalueContext::StorageDead);
                     }
                 }
             }
@@ -346,13 +340,11 @@ macro_rules! make_mir_visitor {
                                 block: BasicBlock,
                                 terminator: &$($mutability)* Terminator<'tcx>) {
                 let Terminator {
-                    ref $($mutability)* span,
-                    ref $($mutability)* scope,
+                    ref $($mutability)* source_info,
                     ref $($mutability)* kind,
                 } = *terminator;
 
-                self.visit_span(span);
-                self.visit_scope_id(scope);
+                self.visit_source_info(source_info);
                 self.visit_terminator_kind(block, kind);
             }
 
@@ -396,7 +388,8 @@ macro_rules! make_mir_visitor {
                     }
 
                     TerminatorKind::Resume |
-                    TerminatorKind::Return => {
+                    TerminatorKind::Return |
+                    TerminatorKind::Unreachable => {
                     }
 
                     TerminatorKind::Drop { ref $($mutability)* location,
@@ -532,15 +525,6 @@ macro_rules! make_mir_visitor {
                         }
                     }
 
-                    Rvalue::Slice { ref $($mutability)* input,
-                                    from_start,
-                                    from_end } => {
-                        self.visit_lvalue(input, LvalueContext::Slice {
-                            from_start: from_start,
-                            from_end: from_end,
-                        });
-                    }
-
                     Rvalue::InlineAsm { ref $($mutability)* outputs,
                                         ref $($mutability)* inputs,
                                         asm: _ } => {
@@ -601,6 +585,8 @@ macro_rules! make_mir_visitor {
                 match *proj {
                     ProjectionElem::Deref => {
                     }
+                    ProjectionElem::Subslice { from: _, to: _ } => {
+                    }
                     ProjectionElem::Field(_field, ref $($mutability)* ty) => {
                         self.visit_ty(ty);
                     }
@@ -622,13 +608,11 @@ macro_rules! make_mir_visitor {
                     mutability: _,
                     name: _,
                     ref $($mutability)* ty,
-                    ref $($mutability)* scope,
-                    ref $($mutability)* span,
+                    ref $($mutability)* source_info,
                 } = *var_decl;
 
                 self.visit_ty(ty);
-                self.visit_scope_id(scope);
-                self.visit_span(span);
+                self.visit_source_info(source_info);
             }
 
             fn super_temp_decl(&mut self,
@@ -651,8 +635,8 @@ macro_rules! make_mir_visitor {
                 self.visit_ty(ty);
             }
 
-            fn super_scope_id(&mut self,
-                              _scope_id: & $($mutability)* ScopeId) {
+            fn super_visibility_scope(&mut self,
+                                      _scope: & $($mutability)* VisibilityScope) {
             }
 
             fn super_branch(&mut self,
@@ -707,14 +691,14 @@ macro_rules! make_mir_visitor {
             fn super_span(&mut self, _span: & $($mutability)* Span) {
             }
 
-            fn super_fn_output(&mut self, fn_output: & $($mutability)* FnOutput<'tcx>) {
-                match *fn_output {
-                    FnOutput::FnConverging(ref $($mutability)* ty) => {
-                        self.visit_ty(ty);
-                    }
-                    FnOutput::FnDiverging => {
-                    }
-                }
+            fn super_source_info(&mut self, source_info: & $($mutability)* SourceInfo) {
+                let SourceInfo {
+                    ref $($mutability)* span,
+                    ref $($mutability)* scope,
+                } = *source_info;
+
+                self.visit_span(span);
+                self.visit_visibility_scope(scope);
             }
 
             fn super_ty(&mut self, _ty: & $($mutability)* Ty<'tcx>) {
@@ -764,4 +748,8 @@ pub enum LvalueContext {
 
     // Consumed as part of an operand
     Consume,
+
+    // Starting and ending a storage live range
+    StorageLive,
+    StorageDead,
 }

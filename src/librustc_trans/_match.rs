@@ -190,7 +190,7 @@ use self::FailureHandler::*;
 
 use llvm::{ValueRef, BasicBlockRef};
 use rustc_const_eval::check_match::{self, Constructor, StaticInliner};
-use rustc_const_eval::{compare_lit_exprs, eval_const_expr};
+use rustc_const_eval::{compare_lit_exprs, eval_const_expr, fatal_const_eval_err};
 use rustc::hir::def::{Def, DefMap};
 use rustc::hir::def_id::DefId;
 use middle::expr_use_visitor as euv;
@@ -217,7 +217,7 @@ use type_of;
 use Disr;
 use value::Value;
 use rustc::ty::{self, Ty, TyCtxt};
-use rustc::traits::ProjectionMode;
+use rustc::traits::Reveal;
 use session::config::NoDebugInfo;
 use util::common::indenter;
 use util::nodemap::FnvHashMap;
@@ -230,7 +230,7 @@ use std::fmt;
 use std::rc::Rc;
 use rustc::hir::{self, PatKind};
 use syntax::ast::{self, DUMMY_NODE_ID, NodeId};
-use syntax::codemap::Span;
+use syntax_pos::Span;
 use rustc::hir::fold::Folder;
 use syntax::ptr::P;
 
@@ -239,9 +239,9 @@ struct ConstantExpr<'a>(&'a hir::Expr);
 
 impl<'a> ConstantExpr<'a> {
     fn eq<'b, 'tcx>(self, other: ConstantExpr<'a>, tcx: TyCtxt<'b, 'tcx, 'tcx>) -> bool {
-        match compare_lit_exprs(tcx, self.0, other.0) {
-            Some(result) => result == Ordering::Equal,
-            None => bug!("compare_list_exprs: type mismatch"),
+        match compare_lit_exprs(tcx, self.0.span, self.0, other.0) {
+            Ok(result) => result == Ordering::Equal,
+            Err(_) => bug!("compare_list_exprs: type mismatch"),
         }
     }
 }
@@ -288,7 +288,9 @@ impl<'a, 'b, 'tcx> Opt<'a, 'tcx> {
                 let expr = consts::const_expr(ccx, &lit_expr, bcx.fcx.param_substs, None, Yes);
                 let llval = match expr {
                     Ok((llval, _)) => llval,
-                    Err(err) => bcx.ccx().sess().span_fatal(lit_expr.span, &err.description()),
+                    Err(err) => {
+                        fatal_const_eval_err(bcx.tcx(), err.as_inner(), lit_expr.span, "pattern");
+                    }
                 };
                 let lit_datum = immediate_rvalue(llval, lit_ty);
                 let lit_datum = unpack_datum!(bcx, lit_datum.to_appropriate_datum(bcx));
@@ -297,11 +299,11 @@ impl<'a, 'b, 'tcx> Opt<'a, 'tcx> {
             ConstantRange(ConstantExpr(ref l1), ConstantExpr(ref l2), _) => {
                 let l1 = match consts::const_expr(ccx, &l1, bcx.fcx.param_substs, None, Yes) {
                     Ok((l1, _)) => l1,
-                    Err(err) => bcx.ccx().sess().span_fatal(l1.span, &err.description()),
+                    Err(err) => fatal_const_eval_err(bcx.tcx(), err.as_inner(), l1.span, "pattern"),
                 };
                 let l2 = match consts::const_expr(ccx, &l2, bcx.fcx.param_substs, None, Yes) {
                     Ok((l2, _)) => l2,
-                    Err(err) => bcx.ccx().sess().span_fatal(l2.span, &err.description()),
+                    Err(err) => fatal_const_eval_err(bcx.tcx(), err.as_inner(), l2.span, "pattern"),
                 };
                 RangeResult(Result::new(bcx, l1), Result::new(bcx, l2))
             }
@@ -505,14 +507,16 @@ fn enter_match<'a, 'b, 'p, 'blk, 'tcx, F>(bcx: Block<'blk, 'tcx>,
                                           val: MatchInput,
                                           mut e: F)
                                           -> Vec<Match<'a, 'p, 'blk, 'tcx>> where
-    F: FnMut(&[&'p hir::Pat]) -> Option<Vec<&'p hir::Pat>>,
+    F: FnMut(&[(&'p hir::Pat, Option<Ty<'tcx>>)])
+             -> Option<Vec<(&'p hir::Pat, Option<Ty<'tcx>>)>>,
 {
     debug!("enter_match(bcx={}, m={:?}, col={}, val={:?})",
            bcx.to_str(), m, col, val);
     let _indenter = indenter();
 
     m.iter().filter_map(|br| {
-        e(&br.pats).map(|pats| {
+        let pats : Vec<_> = br.pats.iter().map(|p| (*p, None)).collect();
+        e(&pats).map(|pats| {
             let this = br.pats[col];
             let mut bound_ptrs = br.bound_ptrs.clone();
             match this.node {
@@ -530,7 +534,7 @@ fn enter_match<'a, 'b, 'p, 'blk, 'tcx, F>(bcx: Block<'blk, 'tcx>,
                 _ => {}
             }
             Match {
-                pats: pats,
+                pats: pats.into_iter().map(|p| p.0).collect(),
                 data: br.data,
                 bound_ptrs: bound_ptrs,
                 pat_renaming_map: br.pat_renaming_map,
@@ -550,7 +554,7 @@ fn enter_default<'a, 'p, 'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     // Collect all of the matches that can match against anything.
     enter_match(bcx, m, col, val, |pats| {
-        match pats[col].node {
+        match pats[col].0.node {
             PatKind::Binding(..) | PatKind::Wild => {
                 let mut r = pats[..col].to_vec();
                 r.extend_from_slice(&pats[col + 1..]);
@@ -655,9 +659,8 @@ fn get_branches<'a, 'p, 'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                 ConstantValue(ConstantExpr(&l), debug_loc)
             }
             PatKind::Path(..) | PatKind::TupleStruct(..) | PatKind::Struct(..) => {
-                let opt_def = tcx.def_map.borrow().get(&cur.id).map(|d| d.full_def());
-                match opt_def {
-                    Some(Def::Variant(enum_id, var_id)) => {
+                match tcx.expect_def(cur.id) {
+                    Def::Variant(enum_id, var_id) => {
                         let variant = tcx.lookup_adt_def(enum_id).variant_with_id(var_id);
                         Variant(Disr::from(variant.disr_val),
                                 adt::represent_node(bcx, cur.id),
@@ -729,7 +732,14 @@ fn bind_subslice_pat(bcx: Block,
     let (base, len) = vec_datum.get_vec_base_and_len(bcx);
 
     let slice_begin = InBoundsGEP(bcx, base, &[C_uint(bcx.ccx(), offset_left)]);
-    let slice_len_offset = C_uint(bcx.ccx(), offset_left + offset_right);
+    let diff = offset_left + offset_right;
+    if let ty::TyArray(ty, n) = vec_ty_contents.sty {
+        let array_ty = bcx.tcx().mk_array(ty, n-diff);
+        let llty_array = type_of::type_of(bcx.ccx(), array_ty);
+        return PointerCast(bcx, slice_begin, llty_array.ptr_to());
+    }
+
+    let slice_len_offset = C_uint(bcx.ccx(), diff);
     let slice_len = Sub(bcx, len, slice_len_offset, DebugLoc::None);
     let slice_ty = bcx.tcx().mk_imm_ref(bcx.tcx().mk_region(ty::ReErased),
                                          bcx.tcx().mk_slice(unit_ty));
@@ -787,8 +797,8 @@ fn any_irrefutable_adt_pat(tcx: TyCtxt, m: &[Match], col: usize) -> bool {
         match pat.node {
             PatKind::Tuple(..) => true,
             PatKind::Struct(..) | PatKind::TupleStruct(..) | PatKind::Path(..) => {
-                match tcx.def_map.borrow().get(&pat.id).unwrap().full_def() {
-                    Def::Struct(..) | Def::TyAlias(..) => true,
+                match tcx.expect_def(pat.id) {
+                    Def::Struct(..) | Def::TyAlias(..) | Def::AssociatedTy(..) => true,
                     _ => false,
                 }
             }
@@ -885,7 +895,7 @@ fn compare_values<'blk, 'tcx>(cx: Block<'blk, 'tcx>,
                            &format!("comparison of `{}`", rhs_t),
                            StrEqFnLangItem);
         let args = [lhs_data, lhs_len, rhs_data, rhs_len];
-        Callee::def(bcx.ccx(), did, bcx.tcx().mk_substs(Substs::empty()))
+        Callee::def(bcx.ccx(), did, Substs::empty(bcx.tcx()))
             .call(bcx, debug_loc, ArgVals(&args), None)
     }
 
@@ -1205,7 +1215,12 @@ fn compile_submatch_continue<'a, 'p, 'blk, 'tcx>(mut bcx: Block<'blk, 'tcx>,
         }
         Some(field_vals)
     } else if any_uniq_pat(m, col) || any_region_pat(m, col) {
-        Some(vec!(Load(bcx, val.val)))
+        let ptr = if type_is_fat_ptr(bcx.tcx(), left_ty) {
+            val.val
+        } else {
+            Load(bcx, val.val)
+        };
+        Some(vec!(ptr))
     } else {
         match left_ty.sty {
             ty::TyArray(_, n) => {
@@ -1430,19 +1445,19 @@ pub fn trans_match<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 /// Checks whether the binding in `discr` is assigned to anywhere in the expression `body`
 fn is_discr_reassigned(bcx: Block, discr: &hir::Expr, body: &hir::Expr) -> bool {
     let (vid, field) = match discr.node {
-        hir::ExprPath(..) => match bcx.def(discr.id) {
+        hir::ExprPath(..) => match bcx.tcx().expect_def(discr.id) {
             Def::Local(_, vid) | Def::Upvar(_, vid, _, _) => (vid, None),
             _ => return false
         },
         hir::ExprField(ref base, field) => {
-            let vid = match bcx.tcx().def_map.borrow().get(&base.id).map(|d| d.full_def()) {
+            let vid = match bcx.tcx().expect_def_or_none(base.id) {
                 Some(Def::Local(_, vid)) | Some(Def::Upvar(_, vid, _, _)) => vid,
                 _ => return false
             };
             (vid, Some(mc::NamedField(field.node)))
         },
         hir::ExprTupField(ref base, field) => {
-            let vid = match bcx.tcx().def_map.borrow().get(&base.id).map(|d| d.full_def()) {
+            let vid = match bcx.tcx().expect_def_or_none(base.id) {
                 Some(Def::Local(_, vid)) | Some(Def::Upvar(_, vid, _, _)) => vid,
                 _ => return false
             };
@@ -1456,7 +1471,7 @@ fn is_discr_reassigned(bcx: Block, discr: &hir::Expr, body: &hir::Expr) -> bool 
         field: field,
         reassigned: false
     };
-    bcx.tcx().normalizing_infer_ctxt(ProjectionMode::Any).enter(|infcx| {
+    bcx.tcx().normalizing_infer_ctxt(Reveal::All).enter(|infcx| {
         let mut visitor = euv::ExprUseVisitor::new(&mut rc, &infcx);
         visitor.walk_expr(body);
     });
@@ -1482,20 +1497,27 @@ impl<'tcx> euv::Delegate<'tcx> for ReassignmentChecker {
     fn decl_without_init(&mut self, _: ast::NodeId, _: Span) {}
 
     fn mutate(&mut self, _: ast::NodeId, _: Span, cmt: mc::cmt, _: euv::MutateMode) {
+        let cmt_id = |cmt: &mc::cmt| match cmt.cat {
+            Categorization::Upvar(mc::Upvar { id: ty::UpvarId { var_id: vid, ..}, ..}) |
+            Categorization::Local(vid) => Some(vid),
+            Categorization::Interior(ref base_cmt, mc::InteriorField(_)) => Some(base_cmt.id),
+            _ => None
+        };
         match cmt.cat {
             Categorization::Upvar(mc::Upvar { id: ty::UpvarId { var_id: vid, .. }, .. }) |
             Categorization::Local(vid) => self.reassigned |= self.node == vid,
-            Categorization::Interior(ref base_cmt, mc::InteriorField(field)) => {
-                match base_cmt.cat {
-                    Categorization::Upvar(mc::Upvar { id: ty::UpvarId { var_id: vid, .. }, .. }) |
-                    Categorization::Local(vid) => {
-                        self.reassigned |= self.node == vid &&
-                            (self.field.is_none() || Some(field) == self.field)
-                    },
-                    _ => {}
+            ref cat => {
+                let mut cat = cat;
+                while let &Categorization::Interior(ref base_cmt, mc::InteriorField(field)) = cat {
+                    if let Some(vid) = cmt_id(base_cmt) {
+                        if self.node == vid && (self.field.is_none() || self.field == Some(field)) {
+                            self.reassigned = true;
+                            return;
+                        }
+                    }
+                    cat = &base_cmt.cat;
                 }
-            },
-            _ => {}
+            }
         }
     }
 }
@@ -1571,7 +1593,7 @@ fn trans_match_inner<'blk, 'tcx>(scope_cx: Block<'blk, 'tcx>,
     }
 
     let t = node_id_type(bcx, discr_expr.id);
-    let chk = if t.is_empty(tcx) {
+    let chk = if t.is_uninhabited(tcx) {
         Unreachable
     } else {
         Infallible
@@ -1693,17 +1715,13 @@ pub fn store_local<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             //
             // In such cases, the more general path is unsafe, because
             // it assumes it is matching against a valid value.
-            match simple_name(pat) {
-                Some(name) => {
-                    let var_scope = cleanup::var_scope(tcx, local.id);
-                    return mk_binding_alloca(
-                        bcx, pat.id, name, var_scope, (),
-                        "_match::store_local",
-                        |(), bcx, Datum { val: v, .. }| expr::trans_into(bcx, &init_expr,
-                                                                         expr::SaveIn(v)));
-                }
-
-                None => {}
+            if let Some(name) = simple_name(pat) {
+                let var_scope = cleanup::var_scope(tcx, local.id);
+                return mk_binding_alloca(
+                    bcx, pat.id, name, var_scope, (),
+                    "_match::store_local",
+                    |(), bcx, Datum { val: v, .. }| expr::trans_into(bcx, &init_expr,
+                                                                     expr::SaveIn(v)));
             }
 
             // General path.
@@ -1821,9 +1839,8 @@ pub fn bind_irrefutable_pat<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             }
         }
         PatKind::TupleStruct(_, ref sub_pats, ddpos) => {
-            let opt_def = bcx.tcx().def_map.borrow().get(&pat.id).map(|d| d.full_def());
-            match opt_def {
-                Some(Def::Variant(enum_id, var_id)) => {
+            match bcx.tcx().expect_def(pat.id) {
+                Def::Variant(enum_id, var_id) => {
                     let repr = adt::represent_node(bcx, pat.id);
                     let vinfo = ccx.tcx().lookup_adt_def(enum_id).variant_with_id(var_id);
                     let args = extract_variant_args(bcx,
@@ -1839,7 +1856,7 @@ pub fn bind_irrefutable_pat<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                             cleanup_scope);
                     }
                 }
-                Some(Def::Struct(..)) => {
+                Def::Struct(..) => {
                     let expected_len = match *ccx.tcx().pat_ty(&pat) {
                         ty::TyS{sty: ty::TyStruct(adt_def, _), ..} => {
                             adt_def.struct_variant().fields.len()
@@ -1988,7 +2005,7 @@ pub fn bind_irrefutable_pat<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                         cleanup_scope)
                 });
         }
-        PatKind::Path(..) | PatKind::QPath(..) | PatKind::Wild |
+        PatKind::Path(..) | PatKind::Wild |
         PatKind::Lit(..) | PatKind::Range(..) => ()
     }
     return bcx;

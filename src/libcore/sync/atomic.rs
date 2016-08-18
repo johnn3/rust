@@ -32,7 +32,7 @@
 //! atomically-reference-counted shared pointer).
 //!
 //! Most atomic types may be stored in static variables, initialized using
-//! the provided static initializers like `INIT_ATOMIC_BOOL`. Atomic statics
+//! the provided static initializers like `ATOMIC_BOOL_INIT`. Atomic statics
 //! are often used for lazy global initialization.
 //!
 //!
@@ -74,6 +74,8 @@
 //! ```
 
 #![stable(feature = "rust1", since = "1.0.0")]
+#![cfg_attr(not(target_has_atomic = "8"), allow(dead_code))]
+#![cfg_attr(not(target_has_atomic = "8"), allow(unused_imports))]
 
 use self::Ordering::*;
 
@@ -289,7 +291,7 @@ impl AtomicBool {
     /// Stores a value into the `bool` if the current value is the same as the `current` value.
     ///
     /// The return value is a result indicating whether the new value was written and containing
-    /// the previous value. On success this value is guaranteed to be equal to `new`.
+    /// the previous value. On success this value is guaranteed to be equal to `current`.
     ///
     /// `compare_exchange` takes two `Ordering` arguments to describe the memory ordering of this
     /// operation. The first describes the required ordering if the operation succeeds while the
@@ -633,7 +635,7 @@ impl<T> AtomicPtr<T> {
     /// Stores a value into the pointer if the current value is the same as the `current` value.
     ///
     /// The return value is a result indicating whether the new value was written and containing
-    /// the previous value. On success this value is guaranteed to be equal to `new`.
+    /// the previous value. On success this value is guaranteed to be equal to `current`.
     ///
     /// `compare_exchange` takes two `Ordering` arguments to describe the memory ordering of this
     /// operation. The first describes the required ordering if the operation succeeds while the
@@ -886,7 +888,7 @@ macro_rules! atomic_int {
             ///
             /// The return value is a result indicating whether the new value was written and
             /// containing the previous value. On success this value is guaranteed to be equal to
-            /// `new`.
+            /// `current`.
             ///
             /// `compare_exchange` takes two `Ordering` arguments to describe the memory ordering of
             /// this operation. The first describes the required ordering if the operation succeeds

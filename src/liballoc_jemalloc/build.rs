@@ -33,18 +33,27 @@ fn main() {
                  jemalloc.parent().unwrap().display());
         let stem = jemalloc.file_stem().unwrap().to_str().unwrap();
         let name = jemalloc.file_name().unwrap().to_str().unwrap();
-        let kind = if name.ends_with(".a") {"static"} else {"dylib"};
+        let kind = if name.ends_with(".a") {
+            "static"
+        } else {
+            "dylib"
+        };
         println!("cargo:rustc-link-lib={}={}", kind, &stem[3..]);
-        return
+        return;
     }
 
     let compiler = gcc::Config::new().get_compiler();
-    let ar = build_helper::cc2ar(compiler.path(), &target);
-    let cflags = compiler.args().iter().map(|s| s.to_str().unwrap())
-                         .collect::<Vec<_>>().join(" ");
+    // only msvc returns None for ar so unwrap is okay
+    let ar = build_helper::cc2ar(compiler.path(), &target).unwrap();
+    let cflags = compiler.args()
+                         .iter()
+                         .map(|s| s.to_str().unwrap())
+                         .collect::<Vec<_>>()
+                         .join(" ");
 
     let mut stack = src_dir.join("../jemalloc")
-                           .read_dir().unwrap()
+                           .read_dir()
+                           .unwrap()
                            .map(|e| e.unwrap())
                            .collect::<Vec<_>>();
     while let Some(entry) = stack.pop() {
@@ -57,12 +66,23 @@ fn main() {
     }
 
     let mut cmd = Command::new("sh");
-    cmd.arg(src_dir.join("../jemalloc/configure").to_str().unwrap()
+    cmd.arg(src_dir.join("../jemalloc/configure")
+                   .to_str()
+                   .unwrap()
                    .replace("C:\\", "/c/")
                    .replace("\\", "/"))
        .current_dir(&build_dir)
        .env("CC", compiler.path())
-       .env("EXTRA_CFLAGS", cflags)
+       .env("EXTRA_CFLAGS", cflags.clone())
+       // jemalloc generates Makefile deps using GCC's "-MM" flag. This means
+       // that GCC will run the preprocessor, and only the preprocessor, over
+       // jemalloc's source files. If we don't specify CPPFLAGS, then at least
+       // on ARM that step fails with a "Missing implementation for 32-bit
+       // atomic operations" error. This is because no "-march" flag will be
+       // passed to GCC, and then GCC won't define the
+       // "__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4" macro that jemalloc needs to
+       // select an atomic operation implementation.
+       .env("CPPFLAGS", cflags.clone())
        .env("AR", &ar)
        .env("RANLIB", format!("{} s", ar.display()));
 
@@ -117,9 +137,10 @@ fn main() {
 
     run(&mut cmd);
     run(Command::new("make")
-                .current_dir(&build_dir)
-                .arg("build_lib_static")
-                .arg("-j").arg(env::var("NUM_JOBS").unwrap()));
+            .current_dir(&build_dir)
+            .arg("build_lib_static")
+            .arg("-j")
+            .arg(env::var("NUM_JOBS").unwrap()));
 
     if target.contains("windows") {
         println!("cargo:rustc-link-lib=static=jemalloc");

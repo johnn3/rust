@@ -13,15 +13,15 @@ use constrained_type_params::{identify_constrained_type_params, Parameter};
 use CrateCtxt;
 use hir::def_id::DefId;
 use middle::region::{CodeExtent};
-use rustc::ty::subst::{self, TypeSpace, FnSpace, ParamSpace, SelfSpace};
+use rustc::infer::TypeOrigin;
 use rustc::traits;
 use rustc::ty::{self, Ty, TyCtxt};
 
 use std::collections::HashSet;
 use syntax::ast;
-use syntax::codemap::{Span};
-use syntax::errors::DiagnosticBuilder;
-use syntax::parse::token::keywords;
+use syntax_pos::Span;
+use errors::DiagnosticBuilder;
+
 use rustc::hir::intravisit::{self, Visitor};
 use rustc::hir;
 
@@ -49,7 +49,7 @@ impl<'a, 'gcx, 'tcx> CheckWfFcxBuilder<'a, 'gcx, 'tcx> {
         let id = self.id;
         let span = self.span;
         self.inherited.enter(|inh| {
-            let fcx = FnCtxt::new(&inh, ty::FnDiverging, id);
+            let fcx = FnCtxt::new(&inh, inh.ccx.tcx.types.never, id);
             let wf_tys = f(&fcx, &mut CheckTypeWellFormedVisitor {
                 ccx: fcx.ccx,
                 code: code
@@ -156,7 +156,10 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
         }
     }
 
-    fn check_trait_or_impl_item(&mut self, item_id: ast::NodeId, span: Span) {
+    fn check_trait_or_impl_item(&mut self,
+                                item_id: ast::NodeId,
+                                span: Span,
+                                sig_if_method: Option<&hir::MethodSig>) {
         let code = self.code.clone();
         self.for_id(item_id, span).with_fcx(|fcx, this| {
             let free_substs = &fcx.parameter_environment.free_substs;
@@ -181,7 +184,8 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
                     let predicates = fcx.instantiate_bounds(span, free_substs, &method.predicates);
                     this.check_fn_or_method(fcx, span, &method_ty, &predicates,
                                             free_id_outlive, &mut implied_bounds);
-                    this.check_method_receiver(fcx, span, &method,
+                    let sig_if_method = sig_if_method.expect("bad signature for method");
+                    this.check_method_receiver(fcx, sig_if_method, &method,
                                                free_id_outlive, self_ty);
                 }
                 ty::TypeTraitItem(assoc_type) => {
@@ -203,9 +207,8 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
 
     fn for_id<'tcx>(&self, id: ast::NodeId, span: Span)
                     -> CheckWfFcxBuilder<'ccx, 'gcx, 'tcx> {
-        let param_env = ty::ParameterEnvironment::for_item(self.ccx.tcx, id);
         CheckWfFcxBuilder {
-            inherited: self.ccx.inherited(Some(param_env)),
+            inherited: self.ccx.inherited(id),
             code: self.code.clone(),
             id: id,
             span: span
@@ -389,35 +392,25 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
         }
         implied_bounds.extend(sig.inputs);
 
-        match sig.output {
-            ty::FnConverging(output) => {
-                fcx.register_wf_obligation(output, span, self.code.clone());
+        fcx.register_wf_obligation(sig.output, span, self.code.clone());
 
-                // FIXME(#25759) return types should not be implied bounds
-                implied_bounds.push(output);
-            }
-            ty::FnDiverging => { }
-        }
+        // FIXME(#25759) return types should not be implied bounds
+        implied_bounds.push(sig.output);
 
         self.check_where_clauses(fcx, span, predicates);
     }
 
     fn check_method_receiver<'fcx, 'tcx>(&mut self,
                                          fcx: &FnCtxt<'fcx, 'gcx, 'tcx>,
-                                         span: Span,
+                                         method_sig: &hir::MethodSig,
                                          method: &ty::Method<'tcx>,
                                          free_id_outlive: CodeExtent,
                                          self_ty: ty::Ty<'tcx>)
     {
         // check that the type of the method's receiver matches the
         // method's first parameter.
-
-        let free_substs = &fcx.parameter_environment.free_substs;
-        let fty = fcx.instantiate_type_scheme(span, free_substs, &method.fty);
-        let sig = fcx.tcx.liberate_late_bound_regions(free_id_outlive, &fty.sig);
-
-        debug!("check_method_receiver({:?},cat={:?},self_ty={:?},sig={:?})",
-               method.name, method.explicit_self, self_ty, sig);
+        debug!("check_method_receiver({:?},cat={:?},self_ty={:?})",
+               method.name, method.explicit_self, self_ty);
 
         let rcvr_ty = match method.explicit_self {
             ty::ExplicitSelfCategory::Static => return,
@@ -430,29 +423,44 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
             }
             ty::ExplicitSelfCategory::ByBox => fcx.tcx.mk_box(self_ty)
         };
+
+        let span = method_sig.decl.inputs[0].pat.span;
+
+        let free_substs = &fcx.parameter_environment.free_substs;
+        let fty = fcx.instantiate_type_scheme(span, free_substs, &method.fty);
+        let sig = fcx.tcx.liberate_late_bound_regions(free_id_outlive, &fty.sig);
+
+        debug!("check_method_receiver: sig={:?}", sig);
+
         let rcvr_ty = fcx.instantiate_type_scheme(span, free_substs, &rcvr_ty);
         let rcvr_ty = fcx.tcx.liberate_late_bound_regions(free_id_outlive,
                                                           &ty::Binder(rcvr_ty));
 
         debug!("check_method_receiver: receiver ty = {:?}", rcvr_ty);
 
-        fcx.require_same_types(span, sig.inputs[0], rcvr_ty,
-                               "mismatched method receiver");
+        let origin = TypeOrigin::MethodReceiver(span);
+        fcx.demand_eqtype_with_origin(origin, rcvr_ty, sig.inputs[0]);
     }
 
     fn check_variances_for_type_defn(&self,
                                      item: &hir::Item,
                                      ast_generics: &hir::Generics)
     {
+        let ty = self.tcx().node_id_to_type(item.id);
+        if self.tcx().has_error_field(ty) {
+            return;
+        }
+
         let item_def_id = self.tcx().map.local_def_id(item.id);
         let ty_predicates = self.tcx().lookup_predicates(item_def_id);
+        assert_eq!(ty_predicates.parent, None);
         let variances = self.tcx().item_variances(item_def_id);
 
         let mut constrained_parameters: HashSet<_> =
             variances.types
-                     .iter_enumerated()
-                     .filter(|&(_, _, &variance)| variance != ty::Bivariant)
-                     .map(|(space, index, _)| self.param_ty(ast_generics, space, index))
+                     .iter().enumerate()
+                     .filter(|&(_, &variance)| variance != ty::Bivariant)
+                     .map(|(index, _)| self.param_ty(ast_generics, index))
                      .map(|p| Parameter::Type(p))
                      .collect();
 
@@ -460,53 +468,30 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
                                          None,
                                          &mut constrained_parameters);
 
-        for (space, index, _) in variances.types.iter_enumerated() {
-            let param_ty = self.param_ty(ast_generics, space, index);
+        for (index, _) in variances.types.iter().enumerate() {
+            let param_ty = self.param_ty(ast_generics, index);
             if constrained_parameters.contains(&Parameter::Type(param_ty)) {
                 continue;
             }
-            let span = self.ty_param_span(ast_generics, item, space, index);
+            let span = ast_generics.ty_params[index].span;
             self.report_bivariance(span, param_ty.name);
         }
 
-        for (space, index, &variance) in variances.regions.iter_enumerated() {
+        for (index, &variance) in variances.regions.iter().enumerate() {
             if variance != ty::Bivariant {
                 continue;
             }
 
-            assert_eq!(space, TypeSpace);
             let span = ast_generics.lifetimes[index].lifetime.span;
             let name = ast_generics.lifetimes[index].lifetime.name;
             self.report_bivariance(span, name);
         }
     }
 
-    fn param_ty(&self,
-                ast_generics: &hir::Generics,
-                space: ParamSpace,
-                index: usize)
-                -> ty::ParamTy
-    {
-        let name = match space {
-            TypeSpace => ast_generics.ty_params[index].name,
-            SelfSpace => keywords::SelfType.name(),
-            FnSpace => bug!("Fn space occupied?"),
-        };
-
-        ty::ParamTy { space: space, idx: index as u32, name: name }
-    }
-
-    fn ty_param_span(&self,
-                     ast_generics: &hir::Generics,
-                     item: &hir::Item,
-                     space: ParamSpace,
-                     index: usize)
-                     -> Span
-    {
-        match space {
-            TypeSpace => ast_generics.ty_params[index].span,
-            SelfSpace => item.span,
-            FnSpace => span_bug!(item.span, "Fn space occupied?"),
+    fn param_ty(&self, ast_generics: &hir::Generics, index: usize) -> ty::ParamTy {
+        ty::ParamTy {
+            idx: index as u32,
+            name: ast_generics.ty_params[index].name
         }
     }
 
@@ -533,10 +518,10 @@ impl<'ccx, 'gcx> CheckTypeWellFormedVisitor<'ccx, 'gcx> {
 }
 
 fn reject_shadowing_type_parameters(tcx: TyCtxt, span: Span, generics: &ty::Generics) {
-    let impl_params = generics.types.get_slice(subst::TypeSpace).iter()
-        .map(|tp| tp.name).collect::<HashSet<_>>();
+    let parent = tcx.lookup_generics(generics.parent.unwrap());
+    let impl_params: HashSet<_> = parent.types.iter().map(|tp| tp.name).collect();
 
-    for method_param in generics.types.get_slice(subst::FnSpace) {
+    for method_param in &generics.types {
         if impl_params.contains(&method_param.name) {
             error_194(tcx, span, method_param.name);
         }
@@ -552,13 +537,21 @@ impl<'ccx, 'tcx, 'v> Visitor<'v> for CheckTypeWellFormedVisitor<'ccx, 'tcx> {
 
     fn visit_trait_item(&mut self, trait_item: &'v hir::TraitItem) {
         debug!("visit_trait_item: {:?}", trait_item);
-        self.check_trait_or_impl_item(trait_item.id, trait_item.span);
+        let method_sig = match trait_item.node {
+            hir::TraitItem_::MethodTraitItem(ref sig, _) => Some(sig),
+            _ => None
+        };
+        self.check_trait_or_impl_item(trait_item.id, trait_item.span, method_sig);
         intravisit::walk_trait_item(self, trait_item)
     }
 
     fn visit_impl_item(&mut self, impl_item: &'v hir::ImplItem) {
         debug!("visit_impl_item: {:?}", impl_item);
-        self.check_trait_or_impl_item(impl_item.id, impl_item.span);
+        let method_sig = match impl_item.node {
+            hir::ImplItemKind::Method(ref sig, _) => Some(sig),
+            _ => None
+        };
+        self.check_trait_or_impl_item(impl_item.id, impl_item.span, method_sig);
         intravisit::walk_impl_item(self, impl_item)
     }
 }
@@ -604,7 +597,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // Trait impl: take implied bounds from all types that
                 // appear in the trait reference.
                 let trait_ref = self.instantiate_type_scheme(span, free_substs, trait_ref);
-                trait_ref.substs.types.as_slice().to_vec()
+                trait_ref.substs.types.to_vec()
             }
 
             None => {
@@ -631,8 +624,10 @@ fn error_380(ccx: &CrateCtxt, span: Span) {
 
 fn error_392<'a, 'tcx>(ccx: &CrateCtxt<'a, 'tcx>, span: Span, param_name: ast::Name)
                        -> DiagnosticBuilder<'tcx> {
-    struct_span_err!(ccx.tcx.sess, span, E0392,
-                     "parameter `{}` is never used", param_name)
+    let mut err = struct_span_err!(ccx.tcx.sess, span, E0392,
+                  "parameter `{}` is never used", param_name);
+    err.span_label(span, &format!("unused type parameter"));
+    err
 }
 
 fn error_194(tcx: TyCtxt, span: Span, name: ast::Name) {

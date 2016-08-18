@@ -18,9 +18,8 @@ use rustc::middle::const_val::ConstVal;
 use rustc::ty::{self, Ty};
 
 use rustc::mir::repr::*;
-use std::u32;
 use syntax::ast;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 
 impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
     /// Add a new temporary value of type `ty` storing the result of
@@ -29,12 +28,10 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
     /// NB: **No cleanup is scheduled for this temporary.** You should
     /// call `schedule_drop` once the temporary is initialized.
     pub fn temp(&mut self, ty: Ty<'tcx>) -> Lvalue<'tcx> {
-        let index = self.temp_decls.len();
-        self.temp_decls.push(TempDecl { ty: ty });
-        assert!(index < (u32::MAX) as usize);
-        let lvalue = Lvalue::Temp(index as u32);
+        let temp = self.temp_decls.push(TempDecl { ty: ty });
+        let lvalue = Lvalue::Temp(temp);
         debug!("temp: created temp {:?} with type {:?}",
-               lvalue, self.temp_decls.last().unwrap().ty);
+               lvalue, self.temp_decls[temp].ty);
         lvalue
     }
 
@@ -103,16 +100,15 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
 
     pub fn push_usize(&mut self,
                       block: BasicBlock,
-                      scope_id: ScopeId,
-                      span: Span,
+                      source_info: SourceInfo,
                       value: u64)
                       -> Lvalue<'tcx> {
         let usize_ty = self.hir.usize_ty();
         let temp = self.temp(usize_ty);
         self.cfg.push_assign_constant(
-            block, scope_id, span, &temp,
+            block, source_info, &temp,
             Constant {
-                span: span,
+                span: source_info.span,
                 ty: self.hir.usize_ty(),
                 literal: self.hir.usize_literal(value),
             });

@@ -17,22 +17,23 @@ pub use self::ObligationCauseCode::*;
 
 use hir::def_id::DefId;
 use middle::free_region::FreeRegionMap;
-use ty::subst;
+use ty::subst::Substs;
 use ty::{self, Ty, TyCtxt, TypeFoldable};
 use infer::InferCtxt;
 
 use std::rc::Rc;
 use syntax::ast;
-use syntax::codemap::{Span, DUMMY_SP};
+use syntax_pos::{Span, DUMMY_SP};
 
 pub use self::error_reporting::TraitErrorKey;
 pub use self::coherence::orphan_check;
 pub use self::coherence::overlapping_impls;
 pub use self::coherence::OrphanCheckErr;
 pub use self::fulfill::{FulfillmentContext, GlobalFulfilledPredicates, RegionObligation};
+pub use self::fulfill::DeferredObligation;
 pub use self::project::MismatchedProjectionTypes;
 pub use self::project::{normalize, normalize_projection_type, Normalized};
-pub use self::project::{ProjectionCache, ProjectionCacheSnapshot, ProjectionMode};
+pub use self::project::{ProjectionCache, ProjectionCacheSnapshot, Reveal};
 pub use self::object_safety::ObjectSafetyViolation;
 pub use self::object_safety::MethodViolationCode;
 pub use self::select::{EvaluationCache, SelectionContext, SelectionCache};
@@ -126,6 +127,9 @@ pub enum ObligationCauseCode<'tcx> {
 
     // Types of fields (other than the last) in a struct must be sized.
     FieldSized,
+
+    // Constant expressions must be sized.
+    ConstSized,
 
     // static items must have `Sync` type
     SharedStatic,
@@ -268,7 +272,7 @@ pub enum Vtable<'tcx, N> {
 #[derive(Clone, PartialEq, Eq)]
 pub struct VtableImplData<'tcx, N> {
     pub impl_def_id: DefId,
-    pub substs: &'tcx subst::Substs<'tcx>,
+    pub substs: &'tcx Substs<'tcx>,
     pub nested: Vec<N>
 }
 
@@ -432,7 +436,7 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     let elaborated_env = unnormalized_env.with_caller_bounds(predicates);
 
-    tcx.infer_ctxt(None, Some(elaborated_env), ProjectionMode::AnyFinal).enter(|infcx| {
+    tcx.infer_ctxt(None, Some(elaborated_env), Reveal::NotSpecializable).enter(|infcx| {
         let predicates = match fully_normalize(&infcx, cause,
                                                &infcx.parameter_environment.caller_bounds) {
             Ok(predicates) => predicates,

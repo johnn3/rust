@@ -10,10 +10,11 @@
 
 use syntax::abi::{Abi};
 use syntax::ast;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 
 use rustc::ty::{self, TyCtxt};
 use rustc::mir::repr::{self, Mir};
+use rustc_data_structures::indexed_vec::Idx;
 
 use super::super::gather_moves::{MovePathIndex};
 use super::super::MoveDataParamEnv;
@@ -49,8 +50,7 @@ pub fn sanity_check_via_rustc_peek<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     // `dataflow::build_sets`. (But note it is doing non-standard
     // stuff, so such generalization may not be realistic.)
 
-    let blocks = mir.all_basic_blocks();
-    'next_block: for bb in blocks {
+    for bb in mir.basic_blocks().indices() {
         each_block(tcx, mir, flow_ctxt, results, bb);
     }
 }
@@ -63,10 +63,9 @@ fn each_block<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     O: BitDenotation<Ctxt=MoveDataParamEnv<'tcx>, Idx=MovePathIndex>
 {
     let move_data = &ctxt.move_data;
-    let bb_data = mir.basic_block_data(bb);
-    let &repr::BasicBlockData { ref statements,
-                                ref terminator,
-                                is_cleanup: _ } = bb_data;
+    let repr::BasicBlockData { ref statements,
+                               ref terminator,
+                               is_cleanup: _ } = mir[bb];
 
     let (args, span) = match is_rustc_peek(tcx, terminator) {
         Some(args_and_span) => args_and_span,
@@ -105,6 +104,11 @@ fn each_block<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             repr::StatementKind::Assign(ref lvalue, ref rvalue) => {
                 (lvalue, rvalue)
             }
+            repr::StatementKind::StorageLive(_) |
+            repr::StatementKind::StorageDead(_) => continue,
+            repr::StatementKind::SetDiscriminant{ .. } =>
+                span_bug!(stmt.source_info.span,
+                          "sanity_check should run before Deaggregator inserts SetDiscriminant"),
         };
 
         if lvalue == peek_arg_lval {
@@ -151,7 +155,7 @@ fn each_block<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 fn is_rustc_peek<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                            terminator: &'a Option<repr::Terminator<'tcx>>)
                            -> Option<(&'a [repr::Operand<'tcx>], Span)> {
-    if let Some(repr::Terminator { ref kind, span, .. }) = *terminator {
+    if let Some(repr::Terminator { ref kind, source_info, .. }) = *terminator {
         if let repr::TerminatorKind::Call { func: ref oper, ref args, .. } = *kind
         {
             if let repr::Operand::Constant(ref func) = *oper
@@ -161,7 +165,7 @@ fn is_rustc_peek<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                     let name = tcx.item_name(def_id);
                     if abi == Abi::RustIntrinsic || abi == Abi::PlatformIntrinsic {
                         if name.as_str() == "rustc_peek" {
-                            return Some((args, span));
+                            return Some((args, source_info.span));
                         }
                     }
                 }

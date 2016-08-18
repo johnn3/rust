@@ -28,12 +28,15 @@
 #![feature(question_mark)]
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
+extern crate syntax_pos;
+extern crate rustc_errors as errors;
 
 // for "clarity", rename the graphviz crate to dot; graphviz within `borrowck`
 // refers to the borrowck-specific graphviz adapter traits.
 extern crate graphviz as dot;
 #[macro_use]
 extern crate rustc;
+extern crate rustc_data_structures;
 extern crate rustc_mir;
 extern crate core; // for NonZero
 

@@ -10,11 +10,16 @@
 
 //! Overloadable operators.
 //!
-//! Implementing these traits allows you to get an effect similar to
-//! overloading operators.
+//! Implementing these traits allows you to overload certain operators.
 //!
 //! Some of these traits are imported by the prelude, so they are available in
-//! every Rust program.
+//! every Rust program. Only operators backed by traits can be overloaded. For
+//! example, the addition operator (`+`) can be overloaded through the `Add`
+//! trait, but since the assignment operator (`=`) has no backing trait, there
+//! is no way of overloading its semantics. Additionally, this module does not
+//! provide any mechanism to create new operators. If traitless overloading or
+//! custom operators are required, you should look toward macros or compiler
+//! plugins to extend Rust's syntax.
 //!
 //! Many of the operators take their operands by value. In non-generic
 //! contexts involving built-in types, this is usually not a problem.
@@ -69,9 +74,7 @@
 
 use cmp::PartialOrd;
 use fmt;
-use convert::From;
 use marker::{Sized, Unsize};
-use num::One;
 
 /// The `Drop` trait is used to run some code when a value goes out of scope.
 /// This is sometimes called a 'destructor'.
@@ -1475,7 +1478,7 @@ pub trait IndexMut<Idx: ?Sized>: Index<Idx> {
 ///     assert_eq!(arr[1..3], [  1,2  ]);
 /// }
 /// ```
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RangeFull;
 
@@ -1494,7 +1497,6 @@ impl fmt::Debug for RangeFull {
 /// # Examples
 ///
 /// ```
-/// #![feature(iter_arith)]
 /// fn main() {
 ///     assert_eq!((3..5), std::ops::Range{ start: 3, end: 5 });
 ///     assert_eq!(3+4+5, (3..6).sum());
@@ -1506,7 +1508,7 @@ impl fmt::Debug for RangeFull {
 ///     assert_eq!(arr[1..3], [  1,2  ]);  // Range
 /// }
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]  // not Copy -- see #27186
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Range<Idx> {
     /// The lower bound of the range (inclusive).
@@ -1558,7 +1560,6 @@ impl<Idx: PartialOrd<Idx>> Range<Idx> {
 /// # Examples
 ///
 /// ```
-/// #![feature(iter_arith)]
 /// fn main() {
 ///     assert_eq!((2..), std::ops::RangeFrom{ start: 2 });
 ///     assert_eq!(2+3+4, (2..).take(3).sum());
@@ -1570,7 +1571,7 @@ impl<Idx: PartialOrd<Idx>> Range<Idx> {
 ///     assert_eq!(arr[1..3], [  1,2  ]);
 /// }
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]  // not Copy -- see #27186
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RangeFrom<Idx> {
     /// The lower bound of the range (inclusive).
@@ -1608,6 +1609,7 @@ impl<Idx: PartialOrd<Idx>> RangeFrom<Idx> {
 /// See the [`contains()`](#method.contains) method for its characterization.
 ///
 /// It cannot serve as an iterator because it doesn't have a starting point.
+///
 /// ```
 /// fn main() {
 ///     assert_eq!((..5), std::ops::RangeTo{ end: 5 });
@@ -1619,7 +1621,7 @@ impl<Idx: PartialOrd<Idx>> RangeFrom<Idx> {
 ///     assert_eq!(arr[1..3], [  1,2  ]);
 /// }
 /// ```
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct RangeTo<Idx> {
     /// The upper bound of the range (exclusive).
@@ -1659,7 +1661,7 @@ impl<Idx: PartialOrd<Idx>> RangeTo<Idx> {
 /// # Examples
 ///
 /// ```
-/// #![feature(inclusive_range,inclusive_range_syntax,iter_arith)]
+/// #![feature(inclusive_range,inclusive_range_syntax)]
 /// fn main() {
 ///     assert_eq!((3...5), std::ops::RangeInclusive::NonEmpty{ start: 3, end: 5 });
 ///     assert_eq!(3+4+5, (3...5).sum());
@@ -1669,7 +1671,7 @@ impl<Idx: PartialOrd<Idx>> RangeTo<Idx> {
 ///     assert_eq!(arr[1...2], [  1,2  ]);  // RangeInclusive
 /// }
 /// ```
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]  // not Copy -- see #27186
 #[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
 pub enum RangeInclusive<Idx> {
     /// Empty range (iteration has finished)
@@ -1709,24 +1711,6 @@ impl<Idx: fmt::Debug> fmt::Debug for RangeInclusive<Idx> {
         match *self {
             Empty { ref at } => write!(fmt, "[empty range @ {:?}]", at),
             NonEmpty { ref start, ref end } => write!(fmt, "{:?}...{:?}", start, end),
-        }
-    }
-}
-
-#[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
-impl<Idx: PartialOrd + One + Sub<Output=Idx>> From<Range<Idx>> for RangeInclusive<Idx> {
-    fn from(range: Range<Idx>) -> RangeInclusive<Idx> {
-        use self::RangeInclusive::*;
-
-        if range.start < range.end {
-            NonEmpty {
-                start: range.start,
-                end: range.end - Idx::one() // can't underflow because end > start >= MIN
-            }
-        } else {
-            Empty {
-                at: range.start
-            }
         }
     }
 }
@@ -1774,7 +1758,7 @@ impl<Idx: PartialOrd<Idx>> RangeInclusive<Idx> {
 ///     assert_eq!(arr[1...2], [  1,2  ]);
 /// }
 /// ```
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[unstable(feature = "inclusive_range", reason = "recently added, follows RFC", issue = "28237")]
 pub struct RangeToInclusive<Idx> {
     /// The upper bound of the range (inclusive)
@@ -1950,7 +1934,7 @@ pub trait FnMut<Args> : FnOnce<Args> {
 #[fundamental] // so that regex can rely that `&str: !FnMut`
 pub trait FnOnce<Args> {
     /// The returned type after the call operator is used.
-    #[unstable(feature = "fn_traits", issue = "29625")]
+    #[stable(feature = "fn_once_output", since = "1.12.0")]
     type Output;
 
     /// This is called when the call operator is used.

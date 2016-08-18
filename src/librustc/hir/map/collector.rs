@@ -17,7 +17,7 @@ use hir::def_id::DefId;
 use middle::cstore::InlinedItem;
 use std::iter::repeat;
 use syntax::ast::{NodeId, CRATE_NODE_ID};
-use syntax::codemap::Span;
+use syntax_pos::Span;
 
 /// A Visitor that walks over the HIR and collects Nodes into a HIR map
 pub struct NodeCollector<'ast> {
@@ -194,10 +194,18 @@ impl<'ast> Visitor<'ast> for NodeCollector<'ast> {
         });
     }
 
+    fn visit_ty(&mut self, ty: &'ast Ty) {
+        self.insert(ty.id, NodeTy(ty));
+
+        self.with_parent(ty.id, |this| {
+            intravisit::walk_ty(this, ty);
+        });
+    }
+
     fn visit_fn(&mut self, fk: intravisit::FnKind<'ast>, fd: &'ast FnDecl,
                 b: &'ast Block, s: Span, id: NodeId) {
         assert_eq!(self.parent_node, id);
-        intravisit::walk_fn(self, fk, fd, b, s);
+        intravisit::walk_fn(self, fk, fd, b, s, id);
     }
 
     fn visit_block(&mut self, block: &'ast Block) {

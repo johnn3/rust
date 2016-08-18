@@ -101,7 +101,6 @@ impl<'a, 'tcx> CFGBuilder<'a, 'tcx> {
         match pat.node {
             PatKind::Binding(_, _, None) |
             PatKind::Path(..) |
-            PatKind::QPath(..) |
             PatKind::Lit(..) |
             PatKind::Range(..) |
             PatKind::Wild => {
@@ -380,7 +379,8 @@ impl<'a, 'tcx> CFGBuilder<'a, 'tcx> {
 
         let func_or_rcvr_exit = self.expr(func_or_rcvr, pred);
         let ret = self.straightline(call_expr, func_or_rcvr_exit, args);
-        if fn_ty.fn_ret().diverges() {
+        // FIXME(canndrew): This is_never should probably be an is_uninhabited.
+        if fn_ty.fn_ret().0.is_never() {
             self.add_unreachable_node()
         } else {
             ret
@@ -574,8 +574,8 @@ impl<'a, 'tcx> CFGBuilder<'a, 'tcx> {
             return *self.loop_scopes.last().unwrap();
         }
 
-        match self.tcx.def_map.borrow().get(&expr.id).map(|d| d.full_def()) {
-            Some(Def::Label(loop_id)) => {
+        match self.tcx.expect_def(expr.id) {
+            Def::Label(loop_id) => {
                 for l in &self.loop_scopes {
                     if l.loop_id == loop_id {
                         return *l;

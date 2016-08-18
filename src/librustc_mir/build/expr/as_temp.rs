@@ -30,13 +30,21 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         let this = self;
 
         if let ExprKind::Scope { extent, value } = expr.kind {
-            return this.in_scope(extent, block, |this, _| this.as_temp(block, value));
+            return this.in_scope(extent, block, |this| this.as_temp(block, value));
         }
 
         let expr_ty = expr.ty.clone();
         let temp = this.temp(expr_ty.clone());
         let temp_lifetime = expr.temp_lifetime;
         let expr_span = expr.span;
+        let source_info = this.source_info(expr_span);
+
+        if temp_lifetime.is_some() {
+            this.cfg.push(block, Statement {
+                source_info: source_info,
+                kind: StatementKind::StorageLive(temp.clone())
+            });
+        }
 
         // Careful here not to cause an infinite cycle. If we always
         // called `into`, then for lvalues like `x.f`, it would
@@ -49,8 +57,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             Category::Lvalue => {
                 let lvalue = unpack!(block = this.as_lvalue(block, expr));
                 let rvalue = Rvalue::Use(Operand::Consume(lvalue));
-                let scope_id = this.innermost_scope_id();
-                this.cfg.push_assign(block, scope_id, expr_span, &temp, rvalue);
+                this.cfg.push_assign(block, source_info, &temp, rvalue);
             }
             _ => {
                 unpack!(block = this.into(&temp, block, expr));

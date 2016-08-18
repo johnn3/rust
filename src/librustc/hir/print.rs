@@ -12,8 +12,7 @@ pub use self::AnnNode::*;
 
 use syntax::abi::Abi;
 use syntax::ast;
-use syntax::codemap::{self, CodeMap, BytePos, Spanned};
-use syntax::errors;
+use syntax::codemap::{CodeMap, Spanned};
 use syntax::parse::token::{self, keywords, BinOpToken};
 use syntax::parse::lexer::comments;
 use syntax::print::pp::{self, break_offset, word, space, hardbreak};
@@ -21,6 +20,8 @@ use syntax::print::pp::{Breaks, eof};
 use syntax::print::pp::Breaks::{Consistent, Inconsistent};
 use syntax::print::pprust::{self as ast_pp, PrintState};
 use syntax::ptr::P;
+use syntax_pos::{self, BytePos};
+use errors;
 
 use hir;
 use hir::{Crate, PatKind, RegionTyParamBound, SelfKind, TraitTyParamBound, TraitBoundModifier};
@@ -368,11 +369,11 @@ impl<'a> State<'a> {
         self.end() // close the head-box
     }
 
-    pub fn bclose_(&mut self, span: codemap::Span, indented: usize) -> io::Result<()> {
+    pub fn bclose_(&mut self, span: syntax_pos::Span, indented: usize) -> io::Result<()> {
         self.bclose_maybe_open(span, indented, true)
     }
     pub fn bclose_maybe_open(&mut self,
-                             span: codemap::Span,
+                             span: syntax_pos::Span,
                              indented: usize,
                              close_box: bool)
                              -> io::Result<()> {
@@ -384,7 +385,7 @@ impl<'a> State<'a> {
         }
         Ok(())
     }
-    pub fn bclose(&mut self, span: codemap::Span) -> io::Result<()> {
+    pub fn bclose(&mut self, span: syntax_pos::Span) -> io::Result<()> {
         self.bclose_(span, indent_unit)
     }
 
@@ -432,7 +433,7 @@ impl<'a> State<'a> {
                                   mut get_span: G)
                                   -> io::Result<()>
         where F: FnMut(&mut State, &T) -> io::Result<()>,
-              G: FnMut(&T) -> codemap::Span
+              G: FnMut(&T) -> syntax_pos::Span
     {
         self.rbox(0, b)?;
         let len = elts.len();
@@ -503,6 +504,9 @@ impl<'a> State<'a> {
                 self.print_opt_lifetime(lifetime)?;
                 self.print_mt(mt)?;
             }
+            hir::TyNever => {
+                word(&mut self.s, "!")?;
+            },
             hir::TyTup(ref elts) => {
                 self.popen()?;
                 self.commasep(Inconsistent, &elts[..], |s, ty| s.print_type(&ty))?;
@@ -534,6 +538,9 @@ impl<'a> State<'a> {
             }
             hir::TyPolyTraitRef(ref bounds) => {
                 self.print_bounds("", &bounds[..])?;
+            }
+            hir::TyImplTrait(ref bounds) => {
+                self.print_bounds("impl ", &bounds[..])?;
             }
             hir::TyFixedLengthVec(ref ty, ref v) => {
                 word(&mut self.s, "[")?;
@@ -859,7 +866,7 @@ impl<'a> State<'a> {
                           enum_definition: &hir::EnumDef,
                           generics: &hir::Generics,
                           name: ast::Name,
-                          span: codemap::Span,
+                          span: syntax_pos::Span,
                           visibility: &hir::Visibility)
                           -> io::Result<()> {
         self.head(&visibility_qualified(visibility, "enum"))?;
@@ -872,7 +879,7 @@ impl<'a> State<'a> {
 
     pub fn print_variants(&mut self,
                           variants: &[hir::Variant],
-                          span: codemap::Span)
+                          span: syntax_pos::Span)
                           -> io::Result<()> {
         self.bopen()?;
         for v in variants {
@@ -902,7 +909,7 @@ impl<'a> State<'a> {
                         struct_def: &hir::VariantData,
                         generics: &hir::Generics,
                         name: ast::Name,
-                        span: codemap::Span,
+                        span: syntax_pos::Span,
                         print_finalizer: bool)
                         -> io::Result<()> {
         self.print_name(name)?;
@@ -911,8 +918,9 @@ impl<'a> State<'a> {
             if struct_def.is_tuple() {
                 self.popen()?;
                 self.commasep(Inconsistent, struct_def.fields(), |s, field| {
-                    s.print_visibility(&field.vis)?;
                     s.maybe_print_comment(field.span.lo)?;
+                    s.print_outer_attributes(&field.attrs)?;
+                    s.print_visibility(&field.vis)?;
                     s.print_type(&field.ty)
                 })?;
                 self.pclose()?;
@@ -1695,13 +1703,10 @@ impl<'a> State<'a> {
                 self.commasep(Inconsistent, &data.inputs, |s, ty| s.print_type(&ty))?;
                 word(&mut self.s, ")")?;
 
-                match data.output {
-                    None => {}
-                    Some(ref ty) => {
-                        self.space_if_not_bol()?;
-                        self.word_space("->")?;
-                        self.print_type(&ty)?;
-                    }
+                if let Some(ref ty) = data.output {
+                    self.space_if_not_bol()?;
+                    self.word_space("->")?;
+                    self.print_type(&ty)?;
                 }
             }
         }
@@ -1728,12 +1733,9 @@ impl<'a> State<'a> {
                     }
                 }
                 self.print_name(path1.node)?;
-                match *sub {
-                    Some(ref p) => {
-                        word(&mut self.s, "@")?;
-                        self.print_pat(&p)?;
-                    }
-                    None => (),
+                if let Some(ref p) = *sub {
+                    word(&mut self.s, "@")?;
+                    self.print_pat(&p)?;
                 }
             }
             PatKind::TupleStruct(ref path, ref elts, ddpos) => {
@@ -1754,10 +1756,10 @@ impl<'a> State<'a> {
                 }
                 try!(self.pclose());
             }
-            PatKind::Path(ref path) => {
+            PatKind::Path(None, ref path) => {
                 self.print_path(path, true, 0)?;
             }
-            PatKind::QPath(ref qself, ref path) => {
+            PatKind::Path(Some(ref qself), ref path) => {
                 self.print_qpath(path, qself, false)?;
             }
             PatKind::Struct(ref path, ref fields, etc) => {
@@ -1960,10 +1962,6 @@ impl<'a> State<'a> {
                 self.maybe_print_comment(ty.span.lo)
             }
             hir::DefaultReturn(..) => unreachable!(),
-            hir::NoReturn(span) => {
-                self.word_nbsp("!")?;
-                self.maybe_print_comment(span.lo)
-            }
         }
     }
 
@@ -2196,7 +2194,6 @@ impl<'a> State<'a> {
         self.ibox(indent_unit)?;
         self.word_space("->")?;
         match decl.output {
-            hir::NoReturn(_) => self.word_nbsp("!")?,
             hir::DefaultReturn(..) => unreachable!(),
             hir::Return(ref ty) => self.print_type(&ty)?,
         }
@@ -2239,32 +2236,28 @@ impl<'a> State<'a> {
     }
 
     pub fn maybe_print_trailing_comment(&mut self,
-                                        span: codemap::Span,
+                                        span: syntax_pos::Span,
                                         next_pos: Option<BytePos>)
                                         -> io::Result<()> {
         let cm = match self.cm {
             Some(cm) => cm,
             _ => return Ok(()),
         };
-        match self.next_comment() {
-            Some(ref cmnt) => {
-                if (*cmnt).style != comments::Trailing {
-                    return Ok(());
-                }
-                let span_line = cm.lookup_char_pos(span.hi);
-                let comment_line = cm.lookup_char_pos((*cmnt).pos);
-                let mut next = (*cmnt).pos + BytePos(1);
-                match next_pos {
-                    None => (),
-                    Some(p) => next = p,
-                }
-                if span.hi < (*cmnt).pos && (*cmnt).pos < next &&
-                   span_line.line == comment_line.line {
-                    self.print_comment(cmnt)?;
-                    self.cur_cmnt_and_lit.cur_cmnt += 1;
-                }
+        if let Some(ref cmnt) = self.next_comment() {
+            if (*cmnt).style != comments::Trailing {
+                return Ok(());
             }
-            _ => (),
+            let span_line = cm.lookup_char_pos(span.hi);
+            let comment_line = cm.lookup_char_pos((*cmnt).pos);
+            let mut next = (*cmnt).pos + BytePos(1);
+            if let Some(p) = next_pos {
+                next = p;
+            }
+            if span.hi < (*cmnt).pos && (*cmnt).pos < next &&
+               span_line.line == comment_line.line {
+                self.print_comment(cmnt)?;
+                self.cur_cmnt_and_lit.cur_cmnt += 1;
+            }
         }
         Ok(())
     }

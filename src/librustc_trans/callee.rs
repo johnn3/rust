@@ -22,7 +22,7 @@ use back::symbol_names;
 use llvm::{self, ValueRef, get_params};
 use middle::cstore::LOCAL_CRATE;
 use rustc::hir::def_id::DefId;
-use rustc::ty::subst;
+use rustc::ty::subst::Substs;
 use rustc::traits;
 use rustc::hir::map as hir_map;
 use abi::{Abi, FnType};
@@ -34,8 +34,7 @@ use build::*;
 use cleanup;
 use cleanup::CleanupMethods;
 use closure;
-use common::{self, Block, Result, CrateContext, FunctionContext};
-use common::{C_uint, C_undef};
+use common::{self, Block, Result, CrateContext, FunctionContext, C_undef};
 use consts;
 use datum::*;
 use debuginfo::DebugLoc;
@@ -44,9 +43,10 @@ use expr;
 use glue;
 use inline;
 use intrinsic;
-use machine::{llalign_of_min, llsize_of_store};
+use machine::llalign_of_min;
 use meth;
 use monomorphize::{self, Instance};
+use trans_item::TransItem;
 use type_::Type;
 use type_of;
 use value::Value;
@@ -54,11 +54,9 @@ use Disr;
 use rustc::ty::{self, Ty, TyCtxt, TypeFoldable};
 use rustc::hir;
 
-use syntax::codemap::DUMMY_SP;
-use syntax::errors;
+use syntax_pos::DUMMY_SP;
+use errors;
 use syntax::ptr::P;
-
-use std::cmp;
 
 #[derive(Debug)]
 pub enum CalleeData {
@@ -107,13 +105,12 @@ impl<'tcx> Callee<'tcx> {
     /// Function or method definition.
     pub fn def<'a>(ccx: &CrateContext<'a, 'tcx>,
                    def_id: DefId,
-                   substs: &'tcx subst::Substs<'tcx>)
+                   substs: &'tcx Substs<'tcx>)
                    -> Callee<'tcx> {
         let tcx = ccx.tcx();
 
-        if substs.self_ty().is_some() {
-            // Only trait methods can have a Self parameter.
-            return Callee::trait_method(ccx, def_id, substs);
+        if let Some(trait_id) = tcx.trait_of_item(def_id) {
+            return Callee::trait_method(ccx, trait_id, def_id, substs);
         }
 
         let maybe_node_id = inline::get_local_instance(ccx, def_id)
@@ -146,24 +143,21 @@ impl<'tcx> Callee<'tcx> {
 
     /// Trait method, which has to be resolved to an impl method.
     pub fn trait_method<'a>(ccx: &CrateContext<'a, 'tcx>,
+                            trait_id: DefId,
                             def_id: DefId,
-                            substs: &'tcx subst::Substs<'tcx>)
+                            substs: &'tcx Substs<'tcx>)
                             -> Callee<'tcx> {
         let tcx = ccx.tcx();
 
-        let method_item = tcx.impl_or_trait_item(def_id);
-        let trait_id = method_item.container().id();
-        let trait_ref = ty::Binder(substs.to_trait_ref(tcx, trait_id));
-        let trait_ref = tcx.normalize_associated_type(&trait_ref);
+        let trait_ref = ty::TraitRef::from_method(tcx, trait_id, substs);
+        let trait_ref = tcx.normalize_associated_type(&ty::Binder(trait_ref));
         match common::fulfill_obligation(ccx.shared(), DUMMY_SP, trait_ref) {
             traits::VtableImpl(vtable_impl) => {
                 let impl_did = vtable_impl.impl_def_id;
                 let mname = tcx.item_name(def_id);
                 // create a concatenated set of substitutions which includes
                 // those from the impl and those from the method:
-                let impl_substs = vtable_impl.substs.with_method_from(&substs);
-                let substs = tcx.mk_substs(impl_substs);
-                let mth = meth::get_impl_method(tcx, impl_did, substs, mname);
+                let mth = meth::get_impl_method(tcx, substs, impl_did, vtable_impl.substs, mname);
 
                 // Translate the function, bypassing Callee::def.
                 // That is because default methods have the same ID as the
@@ -277,7 +271,7 @@ impl<'tcx> Callee<'tcx> {
 /// Given a DefId and some Substs, produces the monomorphic item type.
 fn def_ty<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                     def_id: DefId,
-                    substs: &'tcx subst::Substs<'tcx>)
+                    substs: &'tcx Substs<'tcx>)
                     -> Ty<'tcx> {
     let ty = tcx.lookup_item_type(def_id).ty;
     monomorphize::apply_param_substs(tcx, substs, &ty)
@@ -305,7 +299,7 @@ pub fn trans_fn_pointer_shim<'a, 'tcx>(
     let tcx = ccx.tcx();
 
     // Normalize the type for better caching.
-    let bare_fn_ty = tcx.erase_regions(&bare_fn_ty);
+    let bare_fn_ty = tcx.normalize_associated_type(&bare_fn_ty);
 
     // If this is an impl of `Fn` or `FnMut` trait, the receiver is `&self`.
     let is_by_ref = match closure_kind {
@@ -429,7 +423,7 @@ pub fn trans_fn_pointer_shim<'a, 'tcx>(
 /// - `substs`: values for each of the fn/method's parameters
 fn get_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
                     def_id: DefId,
-                    substs: &'tcx subst::Substs<'tcx>)
+                    substs: &'tcx Substs<'tcx>)
                     -> Datum<'tcx, Rvalue> {
     let tcx = ccx.tcx();
 
@@ -471,7 +465,7 @@ fn get_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
         // Should be either intra-crate or inlined.
         assert_eq!(def_id.krate, LOCAL_CRATE);
 
-        let substs = tcx.mk_substs(substs.clone().erase_regions());
+        let substs = tcx.normalize_associated_type(&substs);
         let (val, fn_ty) = monomorphize::monomorphic_fn(ccx, def_id, substs);
         let fn_ptr_ty = match fn_ty.sty {
             ty::TyFnDef(_, _, fty) => {
@@ -539,13 +533,15 @@ fn get_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
     // reference. It also occurs when testing libcore and in some
     // other weird situations. Annoying.
 
-    let sym = instance.symbol_name(ccx.shared());
+    let sym = ccx.symbol_map().get_or_compute(ccx.shared(),
+                                              TransItem::Fn(instance));
+
     let llptrty = type_of::type_of(ccx, fn_ptr_ty);
     let llfn = if let Some(llfn) = declare::get_declared_value(ccx, &sym) {
         if let Some(span) = local_item {
             if declare::get_defined_value(ccx, &sym).is_some() {
                 ccx.sess().span_fatal(span,
-                    &format!("symbol `{}` is already defined", sym));
+                    &format!("symbol `{}` is already defined", &sym));
             }
         }
 
@@ -641,10 +637,7 @@ fn trans_call_inner<'a, 'blk, 'tcx>(mut bcx: Block<'blk, 'tcx>,
     let opt_llretslot = dest.and_then(|dest| match dest {
         expr::SaveIn(dst) => Some(dst),
         expr::Ignore => {
-            let needs_drop = || match output {
-                ty::FnConverging(ret_ty) => bcx.fcx.type_needs_drop(ret_ty),
-                ty::FnDiverging => false
-            };
+            let needs_drop = || bcx.fcx.type_needs_drop(output);
             if fn_ty.ret.is_indirect() || fn_ty.ret.cast.is_some() || needs_drop() {
                 // Push the out-pointer if we use an out-pointer for this
                 // return type, otherwise push "undef".
@@ -689,49 +682,16 @@ fn trans_call_inner<'a, 'blk, 'tcx>(mut bcx: Block<'blk, 'tcx>,
     let (llret, mut bcx) = base::invoke(bcx, llfn, &llargs, debug_loc);
     if !bcx.unreachable.get() {
         fn_ty.apply_attrs_callsite(llret);
-    }
 
-    // If the function we just called does not use an outpointer,
-    // store the result into the rust outpointer. Cast the outpointer
-    // type to match because some ABIs will use a different type than
-    // the Rust type. e.g., a {u32,u32} struct could be returned as
-    // u64.
-    if !fn_ty.ret.is_ignore() && !fn_ty.ret.is_indirect() {
-        if let Some(llforeign_ret_ty) = fn_ty.ret.cast {
-            let llrust_ret_ty = fn_ty.ret.original_ty;
-            let llretslot = opt_llretslot.unwrap();
-
-            // The actual return type is a struct, but the ABI
-            // adaptation code has cast it into some scalar type.  The
-            // code that follows is the only reliable way I have
-            // found to do a transform like i64 -> {i32,i32}.
-            // Basically we dump the data onto the stack then memcpy it.
-            //
-            // Other approaches I tried:
-            // - Casting rust ret pointer to the foreign type and using Store
-            //   is (a) unsafe if size of foreign type > size of rust type and
-            //   (b) runs afoul of strict aliasing rules, yielding invalid
-            //   assembly under -O (specifically, the store gets removed).
-            // - Truncating foreign type to correct integral type and then
-            //   bitcasting to the struct type yields invalid cast errors.
-            let llscratch = base::alloca(bcx, llforeign_ret_ty, "__cast");
-            base::call_lifetime_start(bcx, llscratch);
-            Store(bcx, llret, llscratch);
-            let llscratch_i8 = PointerCast(bcx, llscratch, Type::i8(ccx).ptr_to());
-            let llretptr_i8 = PointerCast(bcx, llretslot, Type::i8(ccx).ptr_to());
-            let llrust_size = llsize_of_store(ccx, llrust_ret_ty);
-            let llforeign_align = llalign_of_min(ccx, llforeign_ret_ty);
-            let llrust_align = llalign_of_min(ccx, llrust_ret_ty);
-            let llalign = cmp::min(llforeign_align, llrust_align);
-            debug!("llrust_size={}", llrust_size);
-
-            if !bcx.unreachable.get() {
-                base::call_memcpy(&B(bcx), llretptr_i8, llscratch_i8,
-                                  C_uint(ccx, llrust_size), llalign as u32);
+        // If the function we just called does not use an outpointer,
+        // store the result into the rust outpointer. Cast the outpointer
+        // type to match because some ABIs will use a different type than
+        // the Rust type. e.g., a {u32,u32} struct could be returned as
+        // u64.
+        if !fn_ty.ret.is_indirect() {
+            if let Some(llretslot) = opt_llretslot {
+                fn_ty.ret.store(&bcx.build(), llret, llretslot);
             }
-            base::call_lifetime_end(bcx, llscratch);
-        } else if let Some(llretslot) = opt_llretslot {
-            base::store_ty(bcx, llret, llretslot, output.unwrap());
         }
     }
 
@@ -739,16 +699,17 @@ fn trans_call_inner<'a, 'blk, 'tcx>(mut bcx: Block<'blk, 'tcx>,
 
     // If the caller doesn't care about the result of this fn call,
     // drop the temporary slot we made.
-    match (dest, opt_llretslot, output) {
-        (Some(expr::Ignore), Some(llretslot), ty::FnConverging(ret_ty)) => {
+    match (dest, opt_llretslot) {
+        (Some(expr::Ignore), Some(llretslot)) => {
             // drop the value if it is not being saved.
-            bcx = glue::drop_ty(bcx, llretslot, ret_ty, debug_loc);
+            bcx = glue::drop_ty(bcx, llretslot, output, debug_loc);
             call_lifetime_end(bcx, llretslot);
         }
         _ => {}
     }
 
-    if output == ty::FnDiverging {
+    // FIXME(canndrew): This is_never should really be an is_uninhabited
+    if output.is_never() {
         Unreachable(bcx);
     }
 

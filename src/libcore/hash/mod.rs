@@ -80,6 +80,9 @@ use mem;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::sip::SipHasher;
 
+#[unstable(feature = "sip_hash_13", issue = "29754")]
+pub use self::sip::{SipHasher13, SipHasher24};
+
 mod sip;
 
 /// A hashable type.
@@ -231,6 +234,16 @@ pub trait BuildHasher {
     type Hasher: Hasher;
 
     /// Creates a new hasher.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::hash_map::RandomState;
+    /// use std::hash::BuildHasher;
+    ///
+    /// let s = RandomState::new();
+    /// let new_s = s.build_hasher();
+    /// ```
     #[stable(since = "1.7.0", feature = "build_hasher")]
     fn build_hasher(&self) -> Self::Hasher;
 }

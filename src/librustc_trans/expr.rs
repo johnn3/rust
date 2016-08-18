@@ -69,7 +69,7 @@ use tvec;
 use type_of;
 use value::Value;
 use Disr;
-use rustc::ty::adjustment::{AdjustDerefRef, AdjustReifyFnPointer};
+use rustc::ty::adjustment::{AdjustNeverToAny, AdjustDerefRef, AdjustReifyFnPointer};
 use rustc::ty::adjustment::{AdjustUnsafeFnPointer, AdjustMutToConstPointer};
 use rustc::ty::adjustment::CustomCoerceUnsized;
 use rustc::ty::{self, Ty, TyCtxt};
@@ -81,8 +81,9 @@ use type_::Type;
 
 use rustc::hir;
 
-use syntax::{ast, codemap};
+use syntax::ast;
 use syntax::parse::token::InternedString;
+use syntax_pos;
 use std::fmt;
 use std::mem;
 
@@ -153,7 +154,7 @@ pub fn trans_into<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             // have side effects. This seems to be reached through tuple struct constructors being
             // passed zero-size constants.
             if let hir::ExprPath(..) = expr.node {
-                match bcx.def(expr.id) {
+                match bcx.tcx().expect_def(expr.id) {
                     Def::Const(_) | Def::AssociatedConst(_) => {
                         assert!(type_is_zero_size(bcx.ccx(), bcx.tcx().node_id_to_type(expr.id)));
                         return bcx;
@@ -172,9 +173,9 @@ pub fn trans_into<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             // `[x; N]` somewhere within.
             match expr.node {
                 hir::ExprPath(..) => {
-                    match bcx.def(expr.id) {
+                    match bcx.tcx().expect_def(expr.id) {
                         Def::Const(did) | Def::AssociatedConst(did) => {
-                            let empty_substs = bcx.tcx().mk_substs(Substs::empty());
+                            let empty_substs = Substs::empty(bcx.tcx());
                             let const_expr = consts::get_const_expr(bcx.ccx(), did, expr,
                                                                     empty_substs);
                             // Temporarily get cleanup scopes out of the way,
@@ -347,6 +348,7 @@ fn adjustment_required<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
     }
 
     match adjustment {
+        AdjustNeverToAny(..) => true,
         AdjustReifyFnPointer => true,
         AdjustUnsafeFnPointer | AdjustMutToConstPointer => {
             // purely a type-level thing
@@ -379,6 +381,12 @@ fn apply_adjustments<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
     debug!("unadjusted datum for expr {:?}: {:?} adjustment={:?}",
            expr, datum, adjustment);
     match adjustment {
+        AdjustNeverToAny(ref target) => {
+            let mono_target = bcx.monomorphize(target);
+            let llty = type_of::type_of(bcx.ccx(), mono_target);
+            let dummy = C_undef(llty.ptr_to());
+            datum = Datum::new(dummy, mono_target, Lvalue::new("never")).to_expr_datum();
+        }
         AdjustReifyFnPointer => {
             match datum.ty.sty {
                 ty::TyFnDef(def_id, substs, _) => {
@@ -454,7 +462,7 @@ fn apply_adjustments<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 }
 
 fn coerce_unsized<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
-                              span: codemap::Span,
+                              span: syntax_pos::Span,
                               source: Datum<'tcx, Rvalue>,
                               target: Datum<'tcx, Rvalue>)
                               -> Block<'blk, 'tcx> {
@@ -651,7 +659,7 @@ fn trans_datum_unadjusted<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             trans(bcx, &e)
         }
         hir::ExprPath(..) => {
-            let var = trans_var(bcx, bcx.def(expr.id));
+            let var = trans_var(bcx, bcx.tcx().expect_def(expr.id));
             DatumBlock::new(bcx, var.to_expr_datum())
         }
         hir::ExprField(ref base, name) => {
@@ -795,7 +803,7 @@ fn trans_index<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             let ix_datum = unpack_datum!(bcx, trans(bcx, idx));
 
             let ref_ty = // invoked methods have LB regions instantiated:
-                bcx.tcx().no_late_bound_regions(&method_ty.fn_ret()).unwrap().unwrap();
+                bcx.tcx().no_late_bound_regions(&method_ty.fn_ret()).unwrap();
             let elt_ty = match ref_ty.builtin_deref(true, ty::NoPreference) {
                 None => {
                     span_bug!(index_expr.span,
@@ -1073,7 +1081,7 @@ fn trans_rvalue_dps_unadjusted<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             trans_into(bcx, &e, dest)
         }
         hir::ExprPath(..) => {
-            trans_def_dps_unadjusted(bcx, expr, bcx.def(expr.id), dest)
+            trans_def_dps_unadjusted(bcx, expr, bcx.tcx().expect_def(expr.id), dest)
         }
         hir::ExprIf(ref cond, ref thn, ref els) => {
             controlflow::trans_if(bcx, expr.id, &cond, &thn, els.as_ref().map(|e| &**e), dest)
@@ -1265,7 +1273,7 @@ fn trans_def_dps_unadjusted<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 fn trans_struct<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                             fields: &[hir::Field],
                             base: Option<&hir::Expr>,
-                            expr_span: codemap::Span,
+                            expr_span: syntax_pos::Span,
                             expr_id: ast::NodeId,
                             ty: Ty<'tcx>,
                             dest: Dest) -> Block<'blk, 'tcx> {
@@ -1511,7 +1519,7 @@ fn trans_unary<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                                           C_integral(llty, min, true), debug_loc);
                         with_cond(bcx, is_min, |bcx| {
                             let msg = InternedString::new(
-                                "attempted to negate with overflow");
+                                "attempt to negate with overflow");
                             controlflow::trans_fail(bcx, expr_info(expr), msg)
                         })
                     } else {
@@ -1694,10 +1702,12 @@ fn trans_scalar_binop<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 }
 
 // refinement types would obviate the need for this
+#[derive(Clone, Copy)]
 enum lazy_binop_ty {
     lazy_and,
     lazy_or,
 }
+
 
 fn trans_lazy_binop<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
                                 binop_expr: &hir::Expr,
@@ -1714,6 +1724,17 @@ fn trans_lazy_binop<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
 
     if past_lhs.unreachable.get() {
         return immediate_rvalue_bcx(past_lhs, lhs, binop_ty).to_expr_datumblock();
+    }
+
+    // If the rhs can never be reached, don't generate code for it.
+    if let Some(cond_val) = const_to_opt_uint(lhs) {
+        match (cond_val, op) {
+            (0, lazy_and) |
+            (1, lazy_or)  => {
+                return immediate_rvalue_bcx(past_lhs, lhs, binop_ty).to_expr_datumblock();
+            }
+            _ => { /* continue */ }
+        }
     }
 
     let join = fcx.new_id_block("join", binop_expr.id);
@@ -2039,7 +2060,7 @@ fn deref_once<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
             };
 
             let ref_ty = // invoked methods have their LB regions instantiated
-                ccx.tcx().no_late_bound_regions(&method_ty.fn_ret()).unwrap().unwrap();
+                ccx.tcx().no_late_bound_regions(&method_ty.fn_ret()).unwrap();
             let scratch = rvalue_scratch_datum(bcx, ref_ty, "overloaded_deref");
 
             bcx = Callee::method(bcx, method)
@@ -2373,7 +2394,7 @@ fn expr_kind<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, expr: &hir::Expr) -> ExprKin
 
     match expr.node {
         hir::ExprPath(..) => {
-            match tcx.resolve_expr(expr) {
+            match tcx.expect_def(expr.id) {
                 // Put functions and ctors with the ADTs, as they
                 // are zero-sized, so DPS is the cheapest option.
                 Def::Struct(..) | Def::Variant(..) |

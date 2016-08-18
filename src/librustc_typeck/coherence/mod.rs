@@ -17,24 +17,24 @@
 
 use hir::def_id::DefId;
 use middle::lang_items::UnsizeTraitLangItem;
-use rustc::ty::subst::{self, Subst};
+use rustc::ty::subst::Subst;
 use rustc::ty::{self, TyCtxt, TypeFoldable};
-use rustc::traits::{self, ProjectionMode};
+use rustc::traits::{self, Reveal};
 use rustc::ty::{ImplOrTraitItemId, ConstTraitItemId};
 use rustc::ty::{MethodTraitItemId, TypeTraitItemId, ParameterEnvironment};
 use rustc::ty::{Ty, TyBool, TyChar, TyEnum, TyError};
 use rustc::ty::{TyParam, TyRawPtr};
-use rustc::ty::{TyRef, TyStruct, TyTrait, TyTuple};
+use rustc::ty::{TyRef, TyStruct, TyTrait, TyNever, TyTuple};
 use rustc::ty::{TyStr, TyArray, TySlice, TyFloat, TyInfer, TyInt};
 use rustc::ty::{TyUint, TyClosure, TyBox, TyFnDef, TyFnPtr};
-use rustc::ty::TyProjection;
+use rustc::ty::{TyProjection, TyAnon};
 use rustc::ty::util::CopyImplementationError;
 use middle::free_region::FreeRegionMap;
 use CrateCtxt;
 use rustc::infer::{self, InferCtxt, TypeOrigin};
 use std::cell::RefCell;
 use std::rc::Rc;
-use syntax::codemap::Span;
+use syntax_pos::Span;
 use util::nodemap::{DefIdMap, FnvHashMap};
 use rustc::dep_graph::DepNode;
 use rustc::hir::map as hir_map;
@@ -75,7 +75,7 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
             }
 
             TyTrait(ref t) => {
-                Some(t.principal_def_id())
+                Some(t.principal.def_id())
             }
 
             TyBox(_) => {
@@ -84,12 +84,12 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
 
             TyBool | TyChar | TyInt(..) | TyUint(..) | TyFloat(..) |
             TyStr | TyArray(..) | TySlice(..) | TyFnDef(..) | TyFnPtr(_) |
-            TyTuple(..) | TyParam(..) | TyError |
+            TyTuple(..) | TyParam(..) | TyError | TyNever |
             TyRawPtr(_) | TyRef(_, _) | TyProjection(..) => {
                 None
             }
 
-            TyInfer(..) | TyClosure(..) => {
+            TyInfer(..) | TyClosure(..) | TyAnon(..) => {
                 // `ty` comes from a user declaration so we should only expect types
                 // that the user can type
                 span_bug!(
@@ -174,12 +174,9 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
     }
 
     fn add_inherent_impl(&self, base_def_id: DefId, impl_def_id: DefId) {
-        match self.inherent_impls.borrow().get(&base_def_id) {
-            Some(implementation_list) => {
-                implementation_list.borrow_mut().push(impl_def_id);
-                return;
-            }
-            None => {}
+        if let Some(implementation_list) = self.inherent_impls.borrow().get(&base_def_id) {
+            implementation_list.borrow_mut().push(impl_def_id);
+            return;
         }
 
         self.inherent_impls.borrow_mut().insert(
@@ -252,8 +249,17 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
                     if let Some(impl_node_id) = tcx.map.as_local_node_id(impl_did) {
                         match tcx.map.find(impl_node_id) {
                             Some(hir_map::NodeItem(item)) => {
-                                span_err!(tcx.sess, item.span, E0120,
-                                          "the Drop trait may only be implemented on structures");
+                                let span = match item.node {
+                                    ItemImpl(_, _, _, _, ref ty, _) => {
+                                        ty.span
+                                    },
+                                    _ => item.span
+                                };
+                                struct_span_err!(tcx.sess, span, E0120,
+                                    "the Drop trait may only be implemented on structures")
+                                    .span_label(span,
+                                                &format!("implementing Drop requires a struct"))
+                                    .emit();
                             }
                             _ => {
                                 bug!("didn't find impl in ast map");
@@ -261,7 +267,7 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
                         }
                     } else {
                         bug!("found external impl of Drop trait on \
-                              :omething other than a struct");
+                              something other than a struct");
                     }
                 }
             }
@@ -305,24 +311,41 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
             match param_env.can_type_implement_copy(tcx, self_type, span) {
                 Ok(()) => {}
                 Err(CopyImplementationError::InfrigingField(name)) => {
-                       span_err!(tcx.sess, span, E0204,
-                                 "the trait `Copy` may not be \
-                                          implemented for this type; field \
-                                          `{}` does not implement `Copy`",
-                                         name)
+                       struct_span_err!(tcx.sess, span, E0204,
+                                 "the trait `Copy` may not be implemented for \
+                                 this type")
+                           .span_label(span, &format!(
+                                 "field `{}` does not implement `Copy`", name)
+                               )
+                           .emit()
+
                 }
                 Err(CopyImplementationError::InfrigingVariant(name)) => {
-                       span_err!(tcx.sess, span, E0205,
-                                 "the trait `Copy` may not be \
-                                          implemented for this type; variant \
-                                          `{}` does not implement `Copy`",
-                                         name)
+                    let item = tcx.map.expect_item(impl_node_id);
+                    let span = if let ItemImpl(_, _, _, Some(ref tr), _, _) = item.node {
+                        tr.path.span
+                    } else {
+                        span
+                    };
+
+                    struct_span_err!(tcx.sess, span, E0205,
+                                     "the trait `Copy` may not be implemented for this type")
+                        .span_label(span, &format!("variant `{}` does not implement `Copy`",
+                                                   name))
+                        .emit()
                 }
                 Err(CopyImplementationError::NotAnAdt) => {
-                       span_err!(tcx.sess, span, E0206,
-                                 "the trait `Copy` may not be implemented \
-                                  for this type; type is not a structure or \
-                                  enumeration")
+                    let item = tcx.map.expect_item(impl_node_id);
+                    let span = if let ItemImpl(_, _, _, _, ref ty, _) = item.node {
+                        ty.span
+                    } else {
+                        span
+                    };
+
+                    struct_span_err!(tcx.sess, span, E0206,
+                                     "the trait `Copy` may not be implemented for this type")
+                        .span_label(span, &format!("type is not a structure or enumeration"))
+                        .emit();
                 }
                 Err(CopyImplementationError::HasDestructor) => {
                     span_err!(tcx.sess, span, E0184,
@@ -363,7 +386,7 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
 
             let source = tcx.lookup_item_type(impl_did).ty;
             let trait_ref = self.crate_context.tcx.impl_trait_ref(impl_did).unwrap();
-            let target = *trait_ref.substs.types.get(subst::TypeSpace, 0);
+            let target = trait_ref.substs.types[1];
             debug!("check_implementations_of_coerce_unsized: {:?} -> {:?} (bound)",
                    source, target);
 
@@ -376,7 +399,7 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
             debug!("check_implementations_of_coerce_unsized: {:?} -> {:?} (free)",
                    source, target);
 
-            tcx.infer_ctxt(None, Some(param_env), ProjectionMode::Topmost).enter(|infcx| {
+            tcx.infer_ctxt(None, Some(param_env), Reveal::ExactMatch).enter(|infcx| {
                 let origin = TypeOrigin::Misc(span);
                 let check_mutbl = |mt_a: ty::TypeAndMut<'gcx>, mt_b: ty::TypeAndMut<'gcx>,
                                    mk_ptr: &Fn(Ty<'gcx>) -> Ty<'gcx>| {
@@ -435,13 +458,25 @@ impl<'a, 'gcx, 'tcx> CoherenceChecker<'a, 'gcx, 'tcx> {
                                        being coerced, none found");
                             return;
                         } else if diff_fields.len() > 1 {
-                            span_err!(tcx.sess, span, E0375,
-                                      "the trait `CoerceUnsized` may only be implemented \
-                                       for a coercion between structures with one field \
-                                       being coerced, but {} fields need coercions: {}",
-                                       diff_fields.len(), diff_fields.iter().map(|&(i, a, b)| {
-                                            format!("{} ({} to {})", fields[i].name, a, b)
-                                       }).collect::<Vec<_>>().join(", "));
+                            let item = tcx.map.expect_item(impl_node_id);
+                            let span = if let ItemImpl(_, _, _, Some(ref t), _, _) = item.node {
+                                t.path.span
+                            } else {
+                                tcx.map.span(impl_node_id)
+                            };
+
+                            let mut err = struct_span_err!(tcx.sess, span, E0375,
+                                      "implementing the trait `CoerceUnsized` \
+                                       requires multiple coercions");
+                            err.note("`CoerceUnsized` may only be implemented for \
+                                      a coercion between structures with one field being coerced");
+                            err.note(&format!("currently, {} fields need coercions: {}",
+                                             diff_fields.len(),
+                                             diff_fields.iter().map(|&(i, a, b)| {
+                                                format!("{} ({} to {})", fields[i].name, a, b)
+                                             }).collect::<Vec<_>>().join(", ") ));
+                            err.span_label(span, &format!("requires multiple coercions"));
+                            err.emit();
                             return;
                         }
 
@@ -513,7 +548,7 @@ fn enforce_trait_manually_implementable(tcx: TyCtxt, sp: Span, trait_def_id: Def
 
 pub fn check_coherence(ccx: &CrateCtxt) {
     let _task = ccx.tcx.dep_graph.in_task(DepNode::Coherence);
-    ccx.tcx.infer_ctxt(None, None, ProjectionMode::Topmost).enter(|infcx| {
+    ccx.tcx.infer_ctxt(None, None, Reveal::ExactMatch).enter(|infcx| {
         CoherenceChecker {
             crate_context: ccx,
             inference_context: infcx,

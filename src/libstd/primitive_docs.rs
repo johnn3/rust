@@ -269,12 +269,17 @@ mod prim_pointer { }
 /// - `Borrow`, `BorrowMut`
 /// - `Default`
 ///
+/// This limitation to `N in 0..33` exists because Rust does not yet support
+/// generics over the size of an array type. `[Foo; 3]` and `[Bar; 3]` are
+/// instances of same generic type `[T; 3]`, but `[Foo; 3]` and `[Foo; 5]` are
+/// entirely different types. As a stopgap, trait implementations are
+/// statically generated for `N in 0..33`.
+///
 /// Arrays coerce to [slices (`[T]`)][slice], so their methods can be called on
-/// arrays.
+/// arrays. Slices are dynamic and do not coerce to arrays; consequently more
+/// methods are defined on `slice` where they support both types.
 ///
 /// [slice]: primitive.slice.html
-///
-/// Rust does not currently support generics over the size of an array type.
 ///
 /// # Examples
 ///
@@ -385,6 +390,10 @@ mod prim_slice { }
 ///
 /// [`.as_ptr()`]: #method.as_ptr
 /// [`len()`]: #method.len
+///
+/// Note: This example shows the internals of `&str`. `unsafe` should not be
+/// used to get a string slice under normal circumstances. Use `.as_slice()`
+/// instead.
 mod prim_str { }
 
 #[doc(primitive = "tuple")]
@@ -490,9 +499,6 @@ mod prim_tuple { }
 ///
 /// *[See also the `std::f32` module](f32/index.html).*
 ///
-/// However, please note that examples are shared between the `f64` and `f32`
-/// primitive types. So it's normal if you see usage of `f64` in there.
-///
 mod prim_f32 { }
 
 #[doc(primitive = "f64")]
@@ -500,9 +506,6 @@ mod prim_f32 { }
 /// The 64-bit floating point type.
 ///
 /// *[See also the `std::f64` module](f64/index.html).*
-///
-/// However, please note that examples are shared between the `f64` and `f32`
-/// primitive types. So it's normal if you see usage of `f32` in there.
 ///
 mod prim_f64 { }
 
@@ -512,6 +515,9 @@ mod prim_f64 { }
 ///
 /// *[See also the `std::i8` module](i8/index.html).*
 ///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `i64` in there.
+///
 mod prim_i8 { }
 
 #[doc(primitive = "i16")]
@@ -519,6 +525,9 @@ mod prim_i8 { }
 /// The 16-bit signed integer type.
 ///
 /// *[See also the `std::i16` module](i16/index.html).*
+///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `i32` in there.
 ///
 mod prim_i16 { }
 
@@ -528,6 +537,9 @@ mod prim_i16 { }
 ///
 /// *[See also the `std::i32` module](i32/index.html).*
 ///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `i16` in there.
+///
 mod prim_i32 { }
 
 #[doc(primitive = "i64")]
@@ -535,6 +547,9 @@ mod prim_i32 { }
 /// The 64-bit signed integer type.
 ///
 /// *[See also the `std::i64` module](i64/index.html).*
+///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `i8` in there.
 ///
 mod prim_i64 { }
 
@@ -544,6 +559,9 @@ mod prim_i64 { }
 ///
 /// *[See also the `std::u8` module](u8/index.html).*
 ///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `u64` in there.
+///
 mod prim_u8 { }
 
 #[doc(primitive = "u16")]
@@ -551,6 +569,9 @@ mod prim_u8 { }
 /// The 16-bit unsigned integer type.
 ///
 /// *[See also the `std::u16` module](u16/index.html).*
+///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `u32` in there.
 ///
 mod prim_u16 { }
 
@@ -560,6 +581,9 @@ mod prim_u16 { }
 ///
 /// *[See also the `std::u32` module](u32/index.html).*
 ///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `u16` in there.
+///
 mod prim_u32 { }
 
 #[doc(primitive = "u64")]
@@ -567,6 +591,9 @@ mod prim_u32 { }
 /// The 64-bit unsigned integer type.
 ///
 /// *[See also the `std::u64` module](u64/index.html).*
+///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `u8` in there.
 ///
 mod prim_u64 { }
 
@@ -576,6 +603,9 @@ mod prim_u64 { }
 ///
 /// *[See also the `std::isize` module](isize/index.html).*
 ///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `usize` in there.
+///
 mod prim_isize { }
 
 #[doc(primitive = "usize")]
@@ -583,5 +613,8 @@ mod prim_isize { }
 /// The pointer-sized unsigned integer type.
 ///
 /// *[See also the `std::usize` module](usize/index.html).*
+///
+/// However, please note that examples are shared between primitive integer
+/// types. So it's normal if you see usage of types like `isize` in there.
 ///
 mod prim_usize { }

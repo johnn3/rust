@@ -20,9 +20,8 @@ use rustc::middle::region::{self, CodeExtent};
 use rustc::middle::region::CodeExtentData;
 use rustc::middle::resolve_lifetime;
 use rustc::middle::stability;
-use rustc::ty::subst;
-use rustc::ty::subst::Subst;
-use rustc::traits::ProjectionMode;
+use rustc::ty::subst::{Subst, Substs};
+use rustc::traits::Reveal;
 use rustc::ty::{self, Ty, TyCtxt, TypeFoldable};
 use rustc::infer::{self, InferOk, InferResult, TypeOrigin};
 use rustc_metadata::cstore::CStore;
@@ -31,12 +30,13 @@ use rustc::session::{self, config};
 use std::rc::Rc;
 use syntax::ast;
 use syntax::abi::Abi;
-use syntax::codemap::{CodeMap, DUMMY_SP};
-use syntax::errors;
-use syntax::errors::emitter::{CoreEmitter, Emitter};
-use syntax::errors::{Level, RenderSpan};
+use syntax::codemap::CodeMap;
+use errors;
+use errors::emitter::Emitter;
+use errors::{Level, DiagnosticBuilder};
 use syntax::parse::token;
 use syntax::feature_gate::UnstableFeatures;
+use syntax_pos::DUMMY_SP;
 
 use rustc::hir;
 
@@ -75,15 +75,12 @@ fn remove_message(e: &mut ExpectErrorEmitter, msg: &str, lvl: Level) {
     }
 }
 
-impl CoreEmitter for ExpectErrorEmitter {
-    fn emit_message(&mut self,
-                    _sp: &RenderSpan,
-                    msg: &str,
-                    _: Option<&str>,
-                    lvl: Level,
-                    _is_header: bool,
-                    _show_snippet: bool) {
-        remove_message(self, msg, lvl);
+impl Emitter for ExpectErrorEmitter {
+    fn emit(&mut self, db: &DiagnosticBuilder) {
+        remove_message(self, &db.message, db.level);
+        for child in &db.children {
+            remove_message(self, &child.message, child.level);
+        }
     }
 }
 
@@ -105,7 +102,7 @@ fn test_env<F>(source_string: &str,
 
     let dep_graph = DepGraph::new(false);
     let _ignore = dep_graph.in_ignore();
-    let cstore = Rc::new(CStore::new(&dep_graph, token::get_ident_interner()));
+    let cstore = Rc::new(CStore::new(&dep_graph));
     let sess = session::build_session_(options, &dep_graph, None, diagnostic_handler,
                                        Rc::new(CodeMap::new()), cstore.clone());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
@@ -115,9 +112,11 @@ fn test_env<F>(source_string: &str,
         input: source_string.to_string(),
     };
     let krate = driver::phase_1_parse_input(&sess, krate_config, &input).unwrap();
-    let driver::ExpansionResult { defs, resolutions, mut hir_forest, .. } =
-        driver::phase_2_configure_and_expand(&sess, &cstore, krate, "test", None, MakeGlobMap::No)
-            .expect("phase 2 aborted");
+    let driver::ExpansionResult { defs, resolutions, mut hir_forest, .. } = {
+        driver::phase_2_configure_and_expand(
+            &sess, &cstore, krate, "test", None, MakeGlobMap::No, |_| Ok(()),
+        ).expect("phase 2 aborted")
+    };
     let _ignore = dep_graph.in_ignore();
 
     let arenas = ty::CtxtArenas::new();
@@ -131,6 +130,7 @@ fn test_env<F>(source_string: &str,
     TyCtxt::create_and_enter(&sess,
                              &arenas,
                              resolutions.def_map,
+                             resolutions.trait_map,
                              named_region_map.unwrap(),
                              ast_map,
                              resolutions.freevars,
@@ -140,7 +140,7 @@ fn test_env<F>(source_string: &str,
                              index,
                              "test_crate",
                              |tcx| {
-        tcx.infer_ctxt(None, None, ProjectionMode::AnyFinal).enter(|infcx| {
+        tcx.infer_ctxt(None, None, Reveal::NotSpecializable).enter(|infcx| {
 
             body(Env { infcx: &infcx });
             let free_regions = FreeRegionMap::new();
@@ -261,7 +261,7 @@ impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
             abi: Abi::Rust,
             sig: ty::Binder(ty::FnSig {
                 inputs: input_args,
-                output: ty::FnConverging(output_ty),
+                output: output_ty,
                 variadic: false,
             }),
         }))
@@ -275,19 +275,17 @@ impl<'a, 'gcx, 'tcx> Env<'a, 'gcx, 'tcx> {
         self.infcx.tcx.mk_tup(vec![ty1, ty2])
     }
 
-    pub fn t_param(&self, space: subst::ParamSpace, index: u32) -> Ty<'tcx> {
+    pub fn t_param(&self, index: u32) -> Ty<'tcx> {
         let name = format!("T{}", index);
-        self.infcx.tcx.mk_param(space, index, token::intern(&name[..]))
+        self.infcx.tcx.mk_param(index, token::intern(&name[..]))
     }
 
     pub fn re_early_bound(&self,
-                          space: subst::ParamSpace,
                           index: u32,
                           name: &'static str)
                           -> ty::Region {
         let name = token::intern(name);
         ty::ReEarlyBound(ty::EarlyBoundRegion {
-            space: space,
             index: index,
             name: name,
         })
@@ -673,12 +671,12 @@ fn subst_ty_renumber_bound() {
 
         // t_source = fn(A)
         let t_source = {
-            let t_param = env.t_param(subst::TypeSpace, 0);
+            let t_param = env.t_param(0);
             env.t_fn(&[t_param], env.t_nil())
         };
 
-        let substs = subst::Substs::new_type(vec![t_rptr_bound1], vec![]);
-        let t_substituted = t_source.subst(env.infcx.tcx, &substs);
+        let substs = Substs::new(env.infcx.tcx, vec![t_rptr_bound1], vec![]);
+        let t_substituted = t_source.subst(env.infcx.tcx, substs);
 
         // t_expected = fn(&'a isize)
         let t_expected = {
@@ -708,12 +706,12 @@ fn subst_ty_renumber_some_bounds() {
 
         // t_source = (A, fn(A))
         let t_source = {
-            let t_param = env.t_param(subst::TypeSpace, 0);
+            let t_param = env.t_param(0);
             env.t_pair(t_param, env.t_fn(&[t_param], env.t_nil()))
         };
 
-        let substs = subst::Substs::new_type(vec![t_rptr_bound1], vec![]);
-        let t_substituted = t_source.subst(env.infcx.tcx, &substs);
+        let substs = Substs::new(env.infcx.tcx, vec![t_rptr_bound1], vec![]);
+        let t_substituted = t_source.subst(env.infcx.tcx, substs);
 
         // t_expected = (&'a isize, fn(&'a isize))
         //
@@ -754,7 +752,7 @@ fn escaping() {
         assert!(t_rptr_bound2.has_escaping_regions());
 
         // t_fn = fn(A)
-        let t_param = env.t_param(subst::TypeSpace, 0);
+        let t_param = env.t_param(0);
         assert!(!t_param.has_escaping_regions());
         let t_fn = env.t_fn(&[t_param], env.t_nil());
         assert!(!t_fn.has_escaping_regions());
@@ -770,12 +768,12 @@ fn subst_region_renumber_region() {
 
         // type t_source<'a> = fn(&'a isize)
         let t_source = {
-            let re_early = env.re_early_bound(subst::TypeSpace, 0, "'a");
+            let re_early = env.re_early_bound(0, "'a");
             env.t_fn(&[env.t_rptr(re_early)], env.t_nil())
         };
 
-        let substs = subst::Substs::new_type(vec![], vec![re_bound1]);
-        let t_substituted = t_source.subst(env.infcx.tcx, &substs);
+        let substs = Substs::new(env.infcx.tcx, vec![], vec![re_bound1]);
+        let t_substituted = t_source.subst(env.infcx.tcx, substs);
 
         // t_expected = fn(&'a isize)
         //

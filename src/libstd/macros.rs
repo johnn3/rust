@@ -98,7 +98,9 @@ macro_rules! print {
     ($($arg:tt)*) => ($crate::io::_print(format_args!($($arg)*)));
 }
 
-/// Macro for printing to the standard output, with a newline.
+/// Macro for printing to the standard output, with a newline. On all
+/// platforms, the newline is the LINE FEED character (`\n`/`U+000A`) alone
+/// (no additional CARRIAGE RETURN (`\r`/`U+000D`).
 ///
 /// Use the `format!` syntax to write data to the standard output.
 /// See `std::fmt` for more information.
@@ -276,7 +278,7 @@ pub mod builtin {
     /// // fn concat_idents!(new, fun, name) { } // not usable in this way!
     /// # }
     /// ```
-    #[stable(feature = "rust1", since = "1.0.0")]
+    #[unstable(feature = "concat_idents", issue = "29599")]
     #[macro_export]
     macro_rules! concat_idents {
         ($($e:ident),*) => ({ /* compiler built-in */ })

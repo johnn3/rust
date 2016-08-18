@@ -22,10 +22,10 @@ use rustc_trans::back::link;
 use rustc_resolve as resolve;
 use rustc_metadata::cstore::CStore;
 
-use syntax::{ast, codemap, errors};
-use syntax::errors::emitter::ColorConfig;
+use syntax::{ast, codemap};
 use syntax::feature_gate::UnstableFeatures;
-use syntax::parse::token;
+use errors;
+use errors::emitter::ColorConfig;
 
 use std::cell::{RefCell, Cell};
 use std::collections::{HashMap, HashSet};
@@ -45,7 +45,6 @@ pub enum MaybeTyped<'a, 'tcx: 'a> {
     NotTyped(&'a session::Session)
 }
 
-pub type Externs = HashMap<String, Vec<String>>;
 pub type ExternalPaths = HashMap<DefId, (Vec<String>, clean::TypeKind)>;
 
 pub struct DocContext<'a, 'tcx: 'a> {
@@ -99,7 +98,7 @@ impl DocAccessLevels for AccessLevels<DefId> {
 
 pub fn run_core(search_paths: SearchPaths,
                 cfgs: Vec<String>,
-                externs: Externs,
+                externs: config::Externs,
                 input: Input,
                 triple: Option<String>) -> (clean::Crate, RenderInfo)
 {
@@ -120,7 +119,6 @@ pub fn run_core(search_paths: SearchPaths,
         lint_cap: Some(lint::Allow),
         externs: externs,
         target_triple: triple.unwrap_or(config::host_triple().to_string()),
-        cfg: config::parse_cfgspecs(cfgs),
         // Ensure that rustdoc works even if rustc is feature-staged
         unstable_features: UnstableFeatures::Allow,
         ..config::basic_options().clone()
@@ -128,19 +126,18 @@ pub fn run_core(search_paths: SearchPaths,
 
     let codemap = Rc::new(codemap::CodeMap::new());
     let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
-                                                               None,
                                                                true,
                                                                false,
-                                                               codemap.clone());
+                                                               Some(codemap.clone()));
 
     let dep_graph = DepGraph::new(false);
     let _ignore = dep_graph.in_ignore();
-    let cstore = Rc::new(CStore::new(&dep_graph, token::get_ident_interner()));
+    let cstore = Rc::new(CStore::new(&dep_graph));
     let sess = session::build_session_(sessopts, &dep_graph, cpath, diagnostic_handler,
                                        codemap, cstore.clone());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
-    let mut cfg = config::build_configuration(&sess);
+    let mut cfg = config::build_configuration(&sess, config::parse_cfgspecs(cfgs));
     target_features::add_configuration(&mut cfg, &sess);
 
     let krate = panictry!(driver::phase_1_parse_input(&sess, cfg, &input));
@@ -148,9 +145,9 @@ pub fn run_core(search_paths: SearchPaths,
     let name = link::find_crate_name(Some(&sess), &krate.attrs, &input);
 
     let driver::ExpansionResult { defs, analysis, resolutions, mut hir_forest, .. } = {
-        let make_glob_map = resolve::MakeGlobMap::No;
-        driver::phase_2_configure_and_expand(&sess, &cstore, krate, &name, None, make_glob_map)
-            .expect("phase_2_configure_and_expand aborted in rustdoc!")
+        driver::phase_2_configure_and_expand(
+            &sess, &cstore, krate, &name, None, resolve::MakeGlobMap::No, |_| Ok(()),
+        ).expect("phase_2_configure_and_expand aborted in rustdoc!")
     };
 
     let arenas = ty::CtxtArenas::new();

@@ -196,20 +196,14 @@ pub const tag_attribute_is_sugared_doc: usize = 0x8c;
 // GAP 0x8d
 pub const tag_items_data_region: usize = 0x8e;
 
-pub const tag_region_param_def: usize = 0x8f;
-pub const tag_region_param_def_ident: usize = 0x90;
-pub const tag_region_param_def_def_id: usize = 0x91;
-pub const tag_region_param_def_space: usize = 0x92;
-pub const tag_region_param_def_index: usize = 0x93;
+pub const tag_item_generics: usize = 0x8f;
+// GAP 0x90, 0x91, 0x92, 0x93, 0x94
 
-pub const tag_type_param_def: usize = 0x94;
+pub const tag_item_predicates: usize = 0x95;
+// GAP 0x96
 
-pub const tag_item_generics: usize = 0x95;
-pub const tag_method_ty_generics: usize = 0x96;
-
-pub const tag_type_predicate: usize = 0x97;
-pub const tag_self_predicate: usize = 0x98;
-pub const tag_fn_predicate: usize = 0x99;
+pub const tag_predicate: usize = 0x97;
+// GAP 0x98, 0x99
 
 pub const tag_unsafety: usize = 0x9a;
 
@@ -252,3 +246,7 @@ pub fn rustc_version() -> String {
 }
 
 pub const tag_panic_strategy: usize = 0x114;
+
+// NB: increment this if you change the format of metadata such that
+// rustc_version can't be found.
+pub const metadata_encoding_version : &'static [u8] = &[b'r', b'u', b's', b't', 0, 0, 0, 2];

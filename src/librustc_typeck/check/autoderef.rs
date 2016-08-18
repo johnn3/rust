@@ -20,7 +20,7 @@ use rustc::ty::subst::Substs;
 use rustc::ty::{LvaluePreference, NoPreference, PreferMutLvalue};
 use rustc::hir;
 
-use syntax::codemap::Span;
+use syntax_pos::Span;
 use syntax::parse::token;
 
 #[derive(Copy, Clone, Debug)]
@@ -54,9 +54,11 @@ impl<'a, 'gcx, 'tcx> Iterator for Autoderef<'a, 'gcx, 'tcx> {
 
         if self.steps.len() == tcx.sess.recursion_limit.get() {
             // We've reached the recursion limit, error gracefully.
-            span_err!(tcx.sess, self.span, E0055,
+            struct_span_err!(tcx.sess, self.span, E0055,
                       "reached the recursion limit while auto-dereferencing {:?}",
-                      self.cur_ty);
+                      self.cur_ty)
+                      .span_label(self.span, &format!("deref recursion limit reached"))
+                      .emit();
             return None;
         }
 
@@ -99,7 +101,7 @@ impl<'a, 'gcx, 'tcx> Autoderef<'a, 'gcx, 'tcx> {
                 Some(f) => f,
                 None => return None
             },
-            substs: tcx.mk_substs(Substs::new_trait(vec![], vec![], self.cur_ty))
+            substs: Substs::new_trait(tcx, vec![], vec![], self.cur_ty)
         };
 
         let cause = traits::ObligationCause::misc(self.span, self.fcx.body_id);

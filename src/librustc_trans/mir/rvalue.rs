@@ -29,7 +29,7 @@ use Disr;
 use super::MirContext;
 use super::constant::const_scalar_checked_binop;
 use super::operand::{OperandRef, OperandValue};
-use super::lvalue::{LvalueRef, get_dataptr, get_meta};
+use super::lvalue::{LvalueRef, get_dataptr};
 
 impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
     pub fn trans_rvalue(&mut self,
@@ -131,27 +131,11 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                     _ => {
                         // FIXME Shouldn't need to manually trigger closure instantiations.
                         if let mir::AggregateKind::Closure(def_id, substs) = *kind {
-                            use rustc::hir;
-                            use syntax::ast::DUMMY_NODE_ID;
-                            use syntax::codemap::DUMMY_SP;
-                            use syntax::ptr::P;
                             use closure;
 
-                            closure::trans_closure_expr(closure::Dest::Ignore(bcx.ccx()),
-                                                        &hir::FnDecl {
-                                                            inputs: P::new(),
-                                                            output: hir::NoReturn(DUMMY_SP),
-                                                            variadic: false
-                                                        },
-                                                        &hir::Block {
-                                                            stmts: P::new(),
-                                                            expr: None,
-                                                            id: DUMMY_NODE_ID,
-                                                            rules: hir::DefaultBlock,
-                                                            span: DUMMY_SP
-                                                        },
-                                                        DUMMY_NODE_ID, def_id,
-                                                        bcx.monomorphize(&substs));
+                            closure::trans_closure_body_via_mir(bcx.ccx(),
+                                                                def_id,
+                                                                bcx.monomorphize(&substs));
                         }
 
                         for (i, operand) in operands.iter().enumerate() {
@@ -167,26 +151,6 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                         }
                     }
                 }
-                bcx
-            }
-
-            mir::Rvalue::Slice { ref input, from_start, from_end } => {
-                let ccx = bcx.ccx();
-                let input = self.trans_lvalue(&bcx, input);
-                let ty = input.ty.to_ty(bcx.tcx());
-                let (llbase1, lllen) = match ty.sty {
-                    ty::TyArray(_, n) => {
-                        (bcx.gepi(input.llval, &[0, from_start]), C_uint(ccx, n))
-                    }
-                    ty::TySlice(_) | ty::TyStr => {
-                        (bcx.gepi(input.llval, &[from_start]), input.llextra)
-                    }
-                    _ => bug!("cannot slice {}", ty)
-                };
-                let adj = C_uint(ccx, from_start + from_end);
-                let lllen1 = bcx.sub(lllen, adj);
-                bcx.store(llbase1, get_dataptr(&bcx, dest.llval));
-                bcx.store(lllen1, get_meta(&bcx, dest.llval));
                 bcx
             }
 
@@ -280,18 +244,46 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                             }
                         }
                     }
-                    mir::CastKind::Misc if common::type_is_immediate(bcx.ccx(), operand.ty) => {
+                    mir::CastKind::Misc if common::type_is_fat_ptr(bcx.tcx(), operand.ty) => {
+                        let ll_cast_ty = type_of::immediate_type_of(bcx.ccx(), cast_ty);
+                        let ll_from_ty = type_of::immediate_type_of(bcx.ccx(), operand.ty);
+                        if let OperandValue::Pair(data_ptr, meta_ptr) = operand.val {
+                            if common::type_is_fat_ptr(bcx.tcx(), cast_ty) {
+                                let ll_cft = ll_cast_ty.field_types();
+                                let ll_fft = ll_from_ty.field_types();
+                                let data_cast = bcx.pointercast(data_ptr, ll_cft[0]);
+                                assert_eq!(ll_cft[1].kind(), ll_fft[1].kind());
+                                OperandValue::Pair(data_cast, meta_ptr)
+                            } else { // cast to thin-ptr
+                                // Cast of fat-ptr to thin-ptr is an extraction of data-ptr and
+                                // pointer-cast of that pointer to desired pointer type.
+                                let llval = bcx.pointercast(data_ptr, ll_cast_ty);
+                                OperandValue::Immediate(llval)
+                            }
+                        } else {
+                            bug!("Unexpected non-Pair operand")
+                        }
+                    }
+                    mir::CastKind::Misc => {
                         debug_assert!(common::type_is_immediate(bcx.ccx(), cast_ty));
                         let r_t_in = CastTy::from_ty(operand.ty).expect("bad input type for cast");
                         let r_t_out = CastTy::from_ty(cast_ty).expect("bad output type for cast");
                         let ll_t_in = type_of::immediate_type_of(bcx.ccx(), operand.ty);
                         let ll_t_out = type_of::immediate_type_of(bcx.ccx(), cast_ty);
-                        let llval = operand.immediate();
-                        let signed = if let CastTy::Int(IntTy::CEnum) = r_t_in {
+                        let (llval, signed) = if let CastTy::Int(IntTy::CEnum) = r_t_in {
                             let repr = adt::represent_type(bcx.ccx(), operand.ty);
-                            adt::is_discr_signed(&repr)
+                            let discr = match operand.val {
+                                OperandValue::Immediate(llval) => llval,
+                                OperandValue::Ref(llptr) => {
+                                    bcx.with_block(|bcx| {
+                                        adt::trans_get_discr(bcx, &repr, llptr, None, true)
+                                    })
+                                }
+                                OperandValue::Pair(..) => bug!("Unexpected Pair operand")
+                            };
+                            (discr, adt::is_discr_signed(&repr))
                         } else {
-                            operand.ty.is_signed()
+                            (operand.immediate(), operand.ty.is_signed())
                         };
 
                         let newval = match (r_t_in, r_t_out) {
@@ -339,26 +331,6 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                             _ => bug!("unsupported cast: {:?} to {:?}", operand.ty, cast_ty)
                         };
                         OperandValue::Immediate(newval)
-                    }
-                    mir::CastKind::Misc => { // Casts from a fat-ptr.
-                        let ll_cast_ty = type_of::immediate_type_of(bcx.ccx(), cast_ty);
-                        let ll_from_ty = type_of::immediate_type_of(bcx.ccx(), operand.ty);
-                        if let OperandValue::Pair(data_ptr, meta_ptr) = operand.val {
-                            if common::type_is_fat_ptr(bcx.tcx(), cast_ty) {
-                                let ll_cft = ll_cast_ty.field_types();
-                                let ll_fft = ll_from_ty.field_types();
-                                let data_cast = bcx.pointercast(data_ptr, ll_cft[0]);
-                                assert_eq!(ll_cft[1].kind(), ll_fft[1].kind());
-                                OperandValue::Pair(data_cast, meta_ptr)
-                            } else { // cast to thin-ptr
-                                // Cast of fat-ptr to thin-ptr is an extraction of data-ptr and
-                                // pointer-cast of that pointer to desired pointer type.
-                                let llval = bcx.pointercast(data_ptr, ll_cast_ty);
-                                OperandValue::Immediate(llval)
-                            }
-                        } else {
-                            bug!("Unexpected non-Pair operand")
-                        }
                     }
                 };
                 let operand = OperandRef {
@@ -428,7 +400,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 };
                 let operand = OperandRef {
                     val: OperandValue::Immediate(llresult),
-                    ty: self.mir.binop_ty(bcx.tcx(), op, lhs.ty, rhs.ty),
+                    ty: op.ty(bcx.tcx(), lhs.ty, rhs.ty),
                 };
                 (bcx, operand)
             }
@@ -438,7 +410,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 let result = self.trans_scalar_checked_binop(&bcx, op,
                                                              lhs.immediate(), rhs.immediate(),
                                                              lhs.ty);
-                let val_ty = self.mir.binop_ty(bcx.tcx(), op, lhs.ty, rhs.ty);
+                let val_ty = op.ty(bcx.tcx(), lhs.ty, rhs.ty);
                 let operand_ty = bcx.tcx().mk_tup(vec![val_ty, bcx.tcx().types.bool]);
                 let operand = OperandRef {
                     val: result,
@@ -498,7 +470,6 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
             }
             mir::Rvalue::Repeat(..) |
             mir::Rvalue::Aggregate(..) |
-            mir::Rvalue::Slice { .. } |
             mir::Rvalue::InlineAsm { .. } => {
                 bug!("cannot generate operand from rvalue {:?}", rvalue);
 
@@ -593,11 +564,8 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
         // will only succeed if both operands are constant.
         // This is necessary to determine when an overflow Assert
         // will always panic at runtime, and produce a warning.
-        match const_scalar_checked_binop(bcx.tcx(), op, lhs, rhs, input_ty) {
-            Some((val, of)) => {
-                return OperandValue::Pair(val, C_bool(bcx.ccx(), of));
-            }
-            None => {}
+        if let Some((val, of)) = const_scalar_checked_binop(bcx.tcx(), op, lhs, rhs, input_ty) {
+            return OperandValue::Pair(val, C_bool(bcx.ccx(), of));
         }
 
         let (val, of) = match op {
@@ -652,7 +620,6 @@ pub fn rvalue_creates_operand<'bcx, 'tcx>(_mir: &mir::Mir<'tcx>,
             true,
         mir::Rvalue::Repeat(..) |
         mir::Rvalue::Aggregate(..) |
-        mir::Rvalue::Slice { .. } |
         mir::Rvalue::InlineAsm { .. } =>
             false,
     }
